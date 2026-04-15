@@ -20,6 +20,9 @@ Thumbs.db
 !tests/fixtures/*.nc
 !tests/fixtures/*.nc4
 
+# Local-only working notes
+PROGRESS.md
+
 # Python (for future PyO3 bindings)
 __pycache__/
 *.py[cod]
