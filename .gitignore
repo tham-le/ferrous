@@ -24,6 +24,10 @@ Thumbs.db
 PROGRESS.md
 FERROUS.md
 GITHUB_RESEARCH.md
+docs/STATUS.md
+
+# Claude Code scratch dir
+.claude/
 
 # Python / PyO3 bindings build artefacts
 __pycache__/
