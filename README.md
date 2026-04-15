@@ -44,29 +44,47 @@ ferrous --endpoint https://esgf-data.dkrz.de/esg-search/search search --variable
 ## Get (sliced fetch)
 
 ```bash
-# Degree-based selection (1D rectilinear grids — most CMIP6 atmospheric data)
+# The FERROUS.md headline example: natural CLI, all human units.
 ferrous get --variable tas --experiment ssp245 --source CNRM-CM6-1 \
-  --lat-deg 30:46 --lon-deg 0:30 --time 0:11 \
+  --time-iso 2020:2050 --lat-deg 43:46 --lon-deg 5:7 \
   --out tas_med.dods
 
-# Or array-index selection (works for every grid, including 2D ocean curvilinear)
+# Atmospheric (1D rectilinear) — degree resolution via 1D axis lookup.
+ferrous get --variable tas --experiment ssp245 --source CNRM-CM6-1 \
+  --lat-deg 30:46 --lon-deg 0:30 --time-iso 2020:2025 \
+  --out tas_med.dods
+
+# Ocean (2D curvilinear tri-polar) — degree resolution via 2D bbox.
 ferrous get \
   --dataset-id "CMIP6.ScenarioMIP.CNRM-CERFACS.CNRM-CM6-1.ssp245.r1i1p1f2.Omon.tos.gn.v20190219|esgf.ceda.ac.uk" \
   --variable tos \
-  --time 0:11 --lat 100:140 --lon 50:80 \
-  --out tos_slice.dods
+  --lat-deg 30:46 --lon-deg 0:30 --time 0:11 \
+  --out tos_med.dods
 
-# Print the constructed OPeNDAP URL without downloading
+# Array-index selection works for any grid (escape hatch).
+ferrous get --dataset-id "…" --variable tos \
+  --time 0:11 --lat 100:140 --lon 50:80 \
+  --out tos_raw.dods
+
+# --dry-run prints the OPeNDAP URL without fetching.
 ferrous get --dataset-id "…" --variable tos --time 0:0 --dry-run --out /dev/null
 
-# Bypass the local cache for one invocation
+# Bypass the local cache for one invocation.
 ferrous --no-cache get --variable tas --lat-deg 0:10 --lon-deg 0:10 --out tas.dods
 ```
 
-`--lat-deg` / `--lon-deg` fetch the file's 1D coordinate axes via
-OPeNDAP, resolve to inclusive index ranges, and feed the result back
-into the constraint. 2D curvilinear grids (CMIP6 ocean tri-polar)
-error out clearly — use `--lat` / `--lon` index ranges there.
+**Resolution modes:**
+
+| Flag | Input | How |
+|---|---|---|
+| `--time` | array indices | direct |
+| `--time-iso START:STOP` | ISO dates (`YYYY` or `YYYY-MM-DD`) | fetches DAS, parses CF units + calendar, converts via chrono |
+| `--lat` / `--lon` | array indices | direct |
+| `--lat-deg` / `--lon-deg` | degrees | fetches coord variables, resolves 1D or 2D |
+
+Supported calendars: `gregorian` / `standard` / `proleptic_gregorian`, and
+`noleap` / `365_day`. Others (`360_day`, `all_leap`, `julian`) error with
+a clear message — fall back to `--time` indices there.
 
 ## Inspect
 
@@ -89,20 +107,24 @@ planned next step.
 
 ## Roadmap
 
-- [x] ESGF Solr search (Dataset + File)
+Done:
+
+- [x] ESGF Solr search (Dataset + File records)
 - [x] OPeNDAP constraint expression builder
 - [x] Polite-mode rate-limited HTTP client
-- [x] `search` subcommand
-- [x] `get` subcommand — index slicing
-- [x] Local cache (content-addressed, never re-fetch)
+- [x] `search` / `get` / `inspect` subcommands
+- [x] Content-addressed local cache — repeat requests = 0 bytes
 - [x] DAP2 binary decoder + Grid container support
-- [x] `inspect` subcommand — local DAP2 introspection
-- [x] Degree-based `--lat-deg` / `--lon-deg` (1D rectilinear)
-- [ ] Date-based `--time-iso 2020-2050` resolution
-- [ ] 2D curvilinear coordinate resolution (CMIP6 ocean grids)
-- [ ] DAP2 → NetCDF4 re-pack
+- [x] Degree-based `--lat-deg` / `--lon-deg` — 1D rectilinear
+- [x] 2D curvilinear coordinate resolution — CMIP6 ocean tri-polar grids
+- [x] ISO date `--time-iso 2020:2050` via CF time-units + calendar parsing
+
+Next:
+
+- [ ] DAP2 → NetCDF4 re-pack (so output opens in xarray directly)
 - [ ] Progress bar on long fetches
 - [ ] Multi-file time-chunked dataset assembly
+- [ ] `360_day` / `all_leap` / `julian` calendar support
 - [ ] PyO3 Python bindings
 - [ ] Argovis (Argo float) support
 
