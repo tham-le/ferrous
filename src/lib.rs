@@ -8,6 +8,7 @@
 //! roadmap.
 
 pub mod error;
+pub mod esgf;
 pub mod http;
 pub mod opendap;
 
