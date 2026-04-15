@@ -338,7 +338,14 @@ fn parse_deg_range(spec: Option<&str>, flag: &str) -> Result<Option<(f64, f64)>>
 }
 
 /// Fetch the lat / lon coordinate variables for a file, resolve the user's
-/// degree ranges to inclusive index ranges. Returns `(lat_idx, lon_idx)`.
+/// degree ranges to inclusive index ranges.
+///
+/// The returned `(lat_or_y_idx, lon_or_x_idx)` pair fills the lat/lon slots
+/// of the constraint regardless of whether the underlying grid is
+/// rectilinear (1D axes, indices in `lat` and `lon` dimension) or
+/// curvilinear (2D `lat[y, x]` / `lon[y, x]`, indices in `y` and `x`).
+/// Either way, the OPeNDAP constraint syntax is the same — inclusive index
+/// ranges in declared-dimension order.
 async fn resolve_lat_lon_degrees(
     http: &Client,
     cache: &Cache,
@@ -348,62 +355,150 @@ async fn resolve_lat_lon_degrees(
     lat_deg: Option<(f64, f64)>,
     lon_deg: Option<(f64, f64)>,
 ) -> Result<(Option<IndexRange>, Option<IndexRange>)> {
-    let lat_idx = if let Some((lo, hi)) = lat_deg {
-        let var_name = lat_coord_override.unwrap_or("lat");
-        let candidates: &[&str] = if lat_coord_override.is_some() {
-            std::slice::from_ref(&var_name)
-        } else {
-            LAT_COORD_CANDIDATES
-        };
-        let axis = fetch_coord_axis(http, cache, opendap_url, candidates).await?;
-        let r = coords::resolve_range(&axis, lo, hi)?;
-        eprintln!(
-            "resolved lat: {lo}..{hi} deg -> idx {}..{} ({} elements, axis spans {} to {})",
-            r.start,
-            r.stop,
-            r.len(),
-            axis[0],
-            axis[axis.len() - 1],
-        );
-        Some(r)
-    } else {
-        None
+    // Nothing requested → nothing to do.
+    if lat_deg.is_none() && lon_deg.is_none() {
+        return Ok((None, None));
+    }
+
+    let lat_var = fetch_coord(
+        http,
+        cache,
+        opendap_url,
+        coord_candidates(lat_coord_override, LAT_COORD_CANDIDATES),
+    )
+    .await?;
+    let lon_var = fetch_coord(
+        http,
+        cache,
+        opendap_url,
+        coord_candidates(lon_coord_override, LON_COORD_CANDIDATES),
+    )
+    .await?;
+
+    match (lat_var.dimensions.len(), lon_var.dimensions.len()) {
+        (1, 1) => resolve_1d(lat_var, lon_var, lat_deg, lon_deg),
+        (2, 2) => resolve_2d(lat_var, lon_var, lat_deg, lon_deg),
+        (a, b) => Err(Error::InvalidArgument(format!(
+            "coordinate variables have mismatched dimensionality \
+             (lat is {a}D, lon is {b}D); ferrous supports either 1D+1D \
+             rectilinear or 2D+2D curvilinear grids"
+        ))),
+    }
+}
+
+/// Build the candidate-names slice for a coord-variable lookup, honouring
+/// an optional user override.
+fn coord_candidates<'a>(override_name: Option<&'a str>, defaults: &'a [&'a str]) -> Vec<&'a str> {
+    match override_name {
+        Some(name) => vec![name],
+        None => defaults.to_vec(),
+    }
+}
+
+fn resolve_1d(
+    lat_var: DapVariable,
+    lon_var: DapVariable,
+    lat_deg: Option<(f64, f64)>,
+    lon_deg: Option<(f64, f64)>,
+) -> Result<(Option<IndexRange>, Option<IndexRange>)> {
+    let lat_idx = match lat_deg {
+        Some((lo, hi)) => {
+            let axis = coord_values_as_f64(&lat_var.data, &lat_var.name)?;
+            let r = coords::resolve_range(&axis, lo, hi)?;
+            eprintln!(
+                "resolved lat: {lo}..{hi} deg -> idx {}..{} ({} elements, 1D axis {}..{})",
+                r.start,
+                r.stop,
+                r.len(),
+                axis[0],
+                axis[axis.len() - 1],
+            );
+            Some(r)
+        }
+        None => None,
     };
-    let lon_idx = if let Some((lo, hi)) = lon_deg {
-        let var_name = lon_coord_override.unwrap_or("lon");
-        let candidates: &[&str] = if lon_coord_override.is_some() {
-            std::slice::from_ref(&var_name)
-        } else {
-            LON_COORD_CANDIDATES
-        };
-        let axis = fetch_coord_axis(http, cache, opendap_url, candidates).await?;
-        let r = coords::resolve_range(&axis, lo, hi)?;
-        eprintln!(
-            "resolved lon: {lo}..{hi} deg -> idx {}..{} ({} elements, axis spans {} to {})",
-            r.start,
-            r.stop,
-            r.len(),
-            axis[0],
-            axis[axis.len() - 1],
-        );
-        Some(r)
-    } else {
-        None
+    let lon_idx = match lon_deg {
+        Some((lo, hi)) => {
+            let axis = coord_values_as_f64(&lon_var.data, &lon_var.name)?;
+            let r = coords::resolve_range(&axis, lo, hi)?;
+            eprintln!(
+                "resolved lon: {lo}..{hi} deg -> idx {}..{} ({} elements, 1D axis {}..{})",
+                r.start,
+                r.stop,
+                r.len(),
+                axis[0],
+                axis[axis.len() - 1],
+            );
+            Some(r)
+        }
+        None => None,
     };
     Ok((lat_idx, lon_idx))
 }
 
-/// Fetch the first matching 1D coordinate variable from the file. Tries each
-/// candidate name in order; succeeds on the first one that returns a
-/// well-formed 1D Float32/Float64 array.
-async fn fetch_coord_axis(
+fn resolve_2d(
+    lat_var: DapVariable,
+    lon_var: DapVariable,
+    lat_deg: Option<(f64, f64)>,
+    lon_deg: Option<(f64, f64)>,
+) -> Result<(Option<IndexRange>, Option<IndexRange>)> {
+    // Curvilinear grids can't decouple lat and lon — the bbox is joint, so
+    // both --lat-deg and --lon-deg must be supplied.
+    let (lat_lo, lat_hi) = lat_deg.ok_or_else(|| {
+        Error::InvalidArgument(
+            "this is a 2D curvilinear grid; both --lat-deg and --lon-deg must be supplied \
+             (or fall back to --lat / --lon index ranges)"
+                .into(),
+        )
+    })?;
+    let (lon_lo, lon_hi) = lon_deg.ok_or_else(|| {
+        Error::InvalidArgument(
+            "this is a 2D curvilinear grid; both --lat-deg and --lon-deg must be supplied \
+             (or fall back to --lat / --lon index ranges)"
+                .into(),
+        )
+    })?;
+
+    if lat_var.dimensions != lon_var.dimensions {
+        return Err(Error::InvalidArgument(format!(
+            "2D lat / lon coord vars must share the same dimensions; got {:?} vs {:?}",
+            lat_var.dimensions, lon_var.dimensions
+        )));
+    }
+    let (ny, nx) = (lat_var.dimensions[0].size, lat_var.dimensions[1].size);
+    let lat_values = coord_values_as_f64(&lat_var.data, &lat_var.name)?;
+    let lon_values = coord_values_as_f64(&lon_var.data, &lon_var.name)?;
+    let (y, x) = coords::resolve_2d_bbox(
+        &lat_values,
+        &lon_values,
+        (ny, nx),
+        (lat_lo, lat_hi),
+        (lon_lo, lon_hi),
+    )?;
+    eprintln!(
+        "resolved 2D curvilinear bbox: lat {lat_lo}..{lat_hi}, lon {lon_lo}..{lon_hi} \
+         -> y={}..{} ({} cells), x={}..{} ({} cells) on {ny}x{nx} grid",
+        y.start,
+        y.stop,
+        y.len(),
+        x.start,
+        x.stop,
+        x.len(),
+    );
+    Ok((Some(y), Some(x)))
+}
+
+/// Fetch the first matching coordinate variable from the file. Tries each
+/// candidate name in order; returns the full `DapVariable` so the caller can
+/// decide whether to drive the 1D or 2D resolver.
+async fn fetch_coord(
     http: &Client,
     cache: &Cache,
     opendap_url: &str,
-    candidates: &[&str],
-) -> Result<Vec<f64>> {
+    candidates: Vec<&str>,
+) -> Result<DapVariable> {
     let mut last_err: Option<Error> = None;
-    for name in candidates {
+    for name in &candidates {
         let url = format!("{opendap_url}.dods?{name}");
         let bytes = match cache.get(&url)? {
             Some(b) => b,
@@ -419,17 +514,11 @@ async fn fetch_coord_axis(
             },
         };
         match dap2::decode(&bytes) {
-            Ok(resp) if !resp.variables.is_empty() => {
-                let v = &resp.variables[0];
-                if v.dimensions.len() != 1 {
-                    return Err(Error::InvalidArgument(format!(
-                        "coordinate variable '{}' is {}D — degree-based resolution \
-                         requires a 1D rectilinear axis (this looks like a curvilinear grid)",
-                        name,
-                        v.dimensions.len()
-                    )));
-                }
-                return coord_values_as_f64(&v.data, name);
+            Ok(mut resp) if !resp.variables.is_empty() => {
+                // When the server wraps a coord in a Grid, the target
+                // variable is the ARRAY (first entry). The MAPS carry the
+                // self-coordinates which we don't need here.
+                return Ok(resp.variables.remove(0));
             }
             Ok(_) => {
                 last_err = Some(Error::Parse(format!(
