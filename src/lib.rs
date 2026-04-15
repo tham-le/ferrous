@@ -7,6 +7,7 @@
 //! Modules are added incrementally as the project grows; see `FERROUS.md` for the
 //! roadmap.
 
+pub mod cache;
 pub mod cli;
 pub mod commands;
 pub mod error;
