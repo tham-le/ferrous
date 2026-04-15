@@ -36,6 +36,11 @@ pub struct Cli {
 }
 
 /// Subcommands accepted by `ferrous`.
+///
+/// Variants differ in size (Get carries many optional flags). The CLI parses
+/// exactly one Command per invocation, so the few hundred bytes saved by
+/// boxing each arg struct aren't worth the indirection.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Search ESGF for datasets matching the given CMIP6 facets.
@@ -111,12 +116,31 @@ pub struct GetArgs {
     pub time: Option<String>,
 
     /// Latitude index slice.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "lat_deg")]
     pub lat: Option<String>,
 
     /// Longitude index slice.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "lon_deg")]
     pub lon: Option<String>,
+
+    /// Latitude range in degrees, `MIN:MAX` (1D rectilinear grids only).
+    /// Resolves to array indices by fetching the file's lat coordinate.
+    #[arg(long, value_name = "MIN:MAX")]
+    pub lat_deg: Option<String>,
+
+    /// Longitude range in degrees, `MIN:MAX`. Use the same convention as the
+    /// dataset (0-360 vs -180-180); auto-rotation isn't done.
+    #[arg(long, value_name = "MIN:MAX")]
+    pub lon_deg: Option<String>,
+
+    /// Override the coordinate-variable name used for `--lat-deg`. Defaults
+    /// try `lat` then `latitude`.
+    #[arg(long, value_name = "VAR")]
+    pub lat_coord: Option<String>,
+
+    /// Override the coordinate-variable name used for `--lon-deg`.
+    #[arg(long, value_name = "VAR")]
+    pub lon_coord: Option<String>,
 
     /// Additional index slices for datasets with extra dimensions (depth,
     /// pressure level, ...). One `--slice` per extra dimension, in declared

@@ -8,11 +8,18 @@ use std::path::Path;
 
 use crate::cache::Cache;
 use crate::cli::{Cli, GetArgs, InspectArgs, SearchArgs};
+use crate::coords::{self, IndexRange};
 use crate::dap2::{self, DapData, DapVariable};
 use crate::esgf::{Dataset, SearchClient, SearchQuery, DEFAULT_SEARCH_ENDPOINT};
 use crate::http::{Client, ClientBuilder, RateLimiter};
 use crate::opendap::{Constraint, Slice};
 use crate::{Error, Result};
+
+/// Coordinate-variable names tried in order when `--lat-coord` / `--lon-coord`
+/// is not supplied. CMIP6 atmospheric data uses `lat` / `lon` consistently;
+/// the longer names are a fallback for older / non-CMIP datasets.
+const LAT_COORD_CANDIDATES: &[&str] = &["lat", "latitude"];
+const LON_COORD_CANDIDATES: &[&str] = &["lon", "longitude"];
 
 /// Build the response cache from global CLI flags.
 pub fn build_cache(cli: &Cli) -> Cache {
@@ -144,8 +151,28 @@ pub async fn run_get(cli: &Cli, args: &GetArgs) -> Result<()> {
         .opendap_url()
         .ok_or_else(|| Error::Parse(format!("file {} has no OPENDAP access URL", file.id)))?;
 
-    // 3. Build the constraint from --time/--lat/--lon/--slice.
-    let constraint = build_constraint(&args.variable, args)?;
+    // 3. Resolve degree → index ranges if --lat-deg / --lon-deg supplied.
+    //    These override the index forms (--lat / --lon).
+    let lat_deg = parse_deg_range(args.lat_deg.as_deref(), "--lat-deg")?;
+    let lon_deg = parse_deg_range(args.lon_deg.as_deref(), "--lon-deg")?;
+    let (lat_idx, lon_idx) = if lat_deg.is_some() || lon_deg.is_some() {
+        let cache = build_cache(cli);
+        resolve_lat_lon_degrees(
+            &http,
+            &cache,
+            &opendap_url,
+            args.lat_coord.as_deref(),
+            args.lon_coord.as_deref(),
+            lat_deg,
+            lon_deg,
+        )
+        .await?
+    } else {
+        (None, None)
+    };
+
+    // 4. Build the constraint from --time + (resolved or raw) --lat/--lon + --slice.
+    let constraint = build_constraint(&args.variable, args, lat_idx, lon_idx)?;
     let fetch_url = format!(
         "{}.dods{}",
         opendap_url,
@@ -177,7 +204,7 @@ pub async fn run_get(cli: &Cli, args: &GetArgs) -> Result<()> {
         return Ok(());
     }
 
-    // 4. Cache lookup → fetch if missing → write to --out.
+    // 5. Cache lookup → fetch if missing → write to --out.
     let cache = build_cache(cli);
     println!();
     let (bytes, source) = match cache.get(&fetch_url)? {
@@ -246,10 +273,29 @@ async fn resolve_dataset_id(client: &SearchClient, args: &GetArgs) -> Result<Str
 
 /// Assemble an OPeNDAP constraint from `--time`, `--lat`, `--lon`, and any
 /// `--slice` arguments, in the CMIP6-conventional order.
-fn build_constraint(variable: &str, args: &GetArgs) -> Result<Constraint> {
+///
+/// `lat_resolved` and `lon_resolved` come from degree-based resolution and
+/// take precedence over the corresponding `args.lat` / `args.lon` index
+/// strings when present.
+fn build_constraint(
+    variable: &str,
+    args: &GetArgs,
+    lat_resolved: Option<IndexRange>,
+    lon_resolved: Option<IndexRange>,
+) -> Result<Constraint> {
     let mut slices: Vec<Slice> = Vec::new();
-    for spec in [&args.time, &args.lat, &args.lon].into_iter().flatten() {
+    if let Some(spec) = &args.time {
         slices.push(spec.parse()?);
+    }
+    match (lat_resolved, args.lat.as_deref()) {
+        (Some(r), _) => slices.push(Slice::range(r.start, r.stop)),
+        (None, Some(spec)) => slices.push(spec.parse()?),
+        (None, None) => {}
+    }
+    match (lon_resolved, args.lon.as_deref()) {
+        (Some(r), _) => slices.push(Slice::range(r.start, r.stop)),
+        (None, Some(spec)) => slices.push(spec.parse()?),
+        (None, None) => {}
     }
     for extra in &args.extra {
         slices.push(extra.parse()?);
@@ -264,6 +310,149 @@ fn build_constraint(variable: &str, args: &GetArgs) -> Result<Constraint> {
         Constraint::new().select(variable, std::iter::empty())
     } else {
         Constraint::new().select(variable, slices)
+    }
+}
+
+/// Parse a `MIN:MAX` floating-point range used by `--lat-deg` / `--lon-deg`.
+fn parse_deg_range(spec: Option<&str>, flag: &str) -> Result<Option<(f64, f64)>> {
+    let Some(s) = spec else {
+        return Ok(None);
+    };
+    let (lo, hi) = s
+        .split_once(':')
+        .ok_or_else(|| Error::InvalidArgument(format!("{flag} must be MIN:MAX, got '{s}'")))?;
+    let lo: f64 = lo
+        .trim()
+        .parse()
+        .map_err(|_| Error::InvalidArgument(format!("{flag} min '{lo}' is not a number")))?;
+    let hi: f64 = hi
+        .trim()
+        .parse()
+        .map_err(|_| Error::InvalidArgument(format!("{flag} max '{hi}' is not a number")))?;
+    if hi < lo {
+        return Err(Error::InvalidArgument(format!(
+            "{flag}: max ({hi}) must be >= min ({lo})"
+        )));
+    }
+    Ok(Some((lo, hi)))
+}
+
+/// Fetch the lat / lon coordinate variables for a file, resolve the user's
+/// degree ranges to inclusive index ranges. Returns `(lat_idx, lon_idx)`.
+async fn resolve_lat_lon_degrees(
+    http: &Client,
+    cache: &Cache,
+    opendap_url: &str,
+    lat_coord_override: Option<&str>,
+    lon_coord_override: Option<&str>,
+    lat_deg: Option<(f64, f64)>,
+    lon_deg: Option<(f64, f64)>,
+) -> Result<(Option<IndexRange>, Option<IndexRange>)> {
+    let lat_idx = if let Some((lo, hi)) = lat_deg {
+        let var_name = lat_coord_override.unwrap_or("lat");
+        let candidates: &[&str] = if lat_coord_override.is_some() {
+            std::slice::from_ref(&var_name)
+        } else {
+            LAT_COORD_CANDIDATES
+        };
+        let axis = fetch_coord_axis(http, cache, opendap_url, candidates).await?;
+        let r = coords::resolve_range(&axis, lo, hi)?;
+        eprintln!(
+            "resolved lat: {lo}..{hi} deg -> idx {}..{} ({} elements, axis spans {} to {})",
+            r.start,
+            r.stop,
+            r.len(),
+            axis[0],
+            axis[axis.len() - 1],
+        );
+        Some(r)
+    } else {
+        None
+    };
+    let lon_idx = if let Some((lo, hi)) = lon_deg {
+        let var_name = lon_coord_override.unwrap_or("lon");
+        let candidates: &[&str] = if lon_coord_override.is_some() {
+            std::slice::from_ref(&var_name)
+        } else {
+            LON_COORD_CANDIDATES
+        };
+        let axis = fetch_coord_axis(http, cache, opendap_url, candidates).await?;
+        let r = coords::resolve_range(&axis, lo, hi)?;
+        eprintln!(
+            "resolved lon: {lo}..{hi} deg -> idx {}..{} ({} elements, axis spans {} to {})",
+            r.start,
+            r.stop,
+            r.len(),
+            axis[0],
+            axis[axis.len() - 1],
+        );
+        Some(r)
+    } else {
+        None
+    };
+    Ok((lat_idx, lon_idx))
+}
+
+/// Fetch the first matching 1D coordinate variable from the file. Tries each
+/// candidate name in order; succeeds on the first one that returns a
+/// well-formed 1D Float32/Float64 array.
+async fn fetch_coord_axis(
+    http: &Client,
+    cache: &Cache,
+    opendap_url: &str,
+    candidates: &[&str],
+) -> Result<Vec<f64>> {
+    let mut last_err: Option<Error> = None;
+    for name in candidates {
+        let url = format!("{opendap_url}.dods?{name}");
+        let bytes = match cache.get(&url)? {
+            Some(b) => b,
+            None => match http.get_bytes(&url).await {
+                Ok(b) => {
+                    let _ = cache.put(&url, &b);
+                    b
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            },
+        };
+        match dap2::decode(&bytes) {
+            Ok(resp) if !resp.variables.is_empty() => {
+                let v = &resp.variables[0];
+                if v.dimensions.len() != 1 {
+                    return Err(Error::InvalidArgument(format!(
+                        "coordinate variable '{}' is {}D — degree-based resolution \
+                         requires a 1D rectilinear axis (this looks like a curvilinear grid)",
+                        name,
+                        v.dimensions.len()
+                    )));
+                }
+                return coord_values_as_f64(&v.data, name);
+            }
+            Ok(_) => {
+                last_err = Some(Error::Parse(format!(
+                    "coordinate response for '{name}' contained no variables"
+                )));
+            }
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        Error::InvalidArgument(format!("no coordinate variable found among {candidates:?}"))
+    }))
+}
+
+fn coord_values_as_f64(data: &DapData, name: &str) -> Result<Vec<f64>> {
+    match data {
+        DapData::F32(v) => Ok(v.iter().map(|&x| x as f64).collect()),
+        DapData::F64(v) => Ok(v.clone()),
+        _ => Err(Error::Parse(format!(
+            "coordinate variable '{name}' is not a floating-point type"
+        ))),
     }
 }
 
