@@ -8,11 +8,12 @@ use std::path::Path;
 
 use crate::cache::Cache;
 use crate::cf_time::CfTimeAxis;
-use crate::cli::{Cli, GetArgs, InspectArgs, SearchArgs};
+use crate::cli::{Cli, GetArgs, InspectArgs, OutputFormat, SearchArgs};
 use crate::coords::{self, IndexRange};
 use crate::dap2::{self, DapData, DapVariable};
 use crate::esgf::{Dataset, SearchClient, SearchQuery, DEFAULT_SEARCH_ENDPOINT};
 use crate::http::{Client, ClientBuilder, RateLimiter};
+use crate::nc_out;
 use crate::opendap::{Constraint, Slice};
 use crate::{Error, Result};
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
@@ -235,15 +236,29 @@ pub async fn run_get(cli: &Cli, args: &GetArgs) -> Result<()> {
         }
     };
     ensure_parent_dir(&args.out)?;
-    fs::write(&args.out, &bytes)?;
+    let format = OutputFormat::resolve(args.format, &args.out);
+    let written_bytes = match format {
+        OutputFormat::Dods => {
+            fs::write(&args.out, &bytes)?;
+            bytes.len()
+        }
+        OutputFormat::Nc => {
+            let response = dap2::decode(&bytes)?;
+            nc_out::write(&args.out, &response)?;
+            fs::metadata(&args.out)
+                .map(|m| m.len() as usize)
+                .unwrap_or(bytes.len())
+        }
+    };
 
     let saved = bytes.len() as f64;
     let full = file.size.unwrap_or(0) as f64;
     println!(
-        "Wrote {} bytes (~{:.2} MB) to {} [via {source}]",
-        bytes.len(),
-        saved / 1_000_000.0,
-        args.out.display()
+        "Wrote {} bytes ({:?}) to {} [transferred {} bytes via {source}]",
+        written_bytes,
+        format,
+        args.out.display(),
+        bytes.len()
     );
     if source == "network" && full > 0.0 && saved > 0.0 {
         let ratio = saved / full * 100.0;

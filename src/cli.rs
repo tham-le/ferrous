@@ -160,13 +160,43 @@ pub struct GetArgs {
     #[arg(long, default_value_t = 1)]
     pub file_index: usize,
 
-    /// Output path for the fetched bytes.
+    /// Output path for the fetched data.
     #[arg(long, short = 'o')]
     pub out: std::path::PathBuf,
+
+    /// Output format: `nc` for NetCDF-3 classic (xarray / PyFerret friendly),
+    /// `dods` for the raw OPeNDAP DAP2 binary. Default: auto-detect from the
+    /// `--out` extension (`.nc` → nc, else dods).
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormat>,
 
     /// Print the constraint URL and resolved file but do not download.
     #[arg(long)]
     pub dry_run: bool,
+}
+
+/// Output file format for `ferrous get`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum OutputFormat {
+    /// NetCDF-3 classic — opens directly in xarray, PyFerret, MATLAB, R.
+    Nc,
+    /// Raw DAP2 binary response. Useful for debugging, readable via pydap.
+    Dods,
+}
+
+impl OutputFormat {
+    /// Pick a format based on the caller's explicit choice, falling back to
+    /// the file extension. `.nc` → [`OutputFormat::Nc`]; anything else →
+    /// [`OutputFormat::Dods`].
+    pub fn resolve(explicit: Option<OutputFormat>, path: &std::path::Path) -> OutputFormat {
+        if let Some(f) = explicit {
+            return f;
+        }
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("nc") => OutputFormat::Nc,
+            _ => OutputFormat::Dods,
+        }
+    }
 }
 
 /// Arguments to `ferrous inspect`.
@@ -270,6 +300,28 @@ mod tests {
             "tos.nc",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn format_defaults_from_extension() {
+        use std::path::Path;
+        assert_eq!(
+            OutputFormat::resolve(None, Path::new("x.nc")),
+            OutputFormat::Nc
+        );
+        assert_eq!(
+            OutputFormat::resolve(None, Path::new("x.dods")),
+            OutputFormat::Dods
+        );
+        assert_eq!(
+            OutputFormat::resolve(None, Path::new("no_ext")),
+            OutputFormat::Dods
+        );
+        // Explicit override wins.
+        assert_eq!(
+            OutputFormat::resolve(Some(OutputFormat::Dods), Path::new("x.nc")),
+            OutputFormat::Dods
+        );
     }
 
     #[test]
