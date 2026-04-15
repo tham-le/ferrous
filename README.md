@@ -98,12 +98,36 @@ ferrous inspect tos_slice.dods --dds
 
 ### Output format
 
-Ferrous writes the OPeNDAP server's DAP2 binary response directly to
-disk. That format is what every OPeNDAP server speaks and is readable
-by pydap, xarray's OPeNDAP backend, and Ferrous's own `inspect`
-subcommand. THREDDS-backed ESGF nodes like CEDA do not advertise
-`.nc` / `.nc4` suffixes, so a local DAP2 → NetCDF4 re-pack is the
-planned next step.
+`ferrous get` auto-detects the format from the `--out` extension:
+
+| Extension | Format | Who reads it |
+|---|---|---|
+| `.nc` | NetCDF-3 classic | xarray, PyFerret, MATLAB, R, Panoply, … |
+| anything else | DAP2 binary | pydap, `ferrous inspect` |
+
+Override with `--format {nc,dods}` if you want a different extension.
+
+The NetCDF-3 writer is ~280 lines of pure Rust — no libnetcdf /
+HDF5 C dependency, works on every platform where `cargo build` works.
+NetCDF-4 (HDF5-backed) is a roadmap item.
+
+## Examples
+
+Three ready-to-run demos live in [`examples/`](examples/):
+
+```bash
+# xarray one-shot
+./examples/run_xarray.sh
+
+# Jupyter notebook
+jupyter notebook examples/xarray_quickstart.ipynb
+
+# PyFerret (journal file)
+pyferret -script examples/pyferret_quickstart.jnl
+```
+
+All three pull the same 77 KB Mediterranean slice and produce a figure
+or summary. See [`examples/README.md`](examples/README.md) for details.
 
 ## Roadmap
 
@@ -118,10 +142,13 @@ Done:
 - [x] Degree-based `--lat-deg` / `--lon-deg` — 1D rectilinear
 - [x] 2D curvilinear coordinate resolution — CMIP6 ocean tri-polar grids
 - [x] ISO date `--time-iso 2020:2050` via CF time-units + calendar parsing
+- [x] NetCDF-3 classic output — `--out file.nc` opens directly in xarray / PyFerret
+- [x] `examples/` — xarray, Jupyter, PyFerret quickstarts
 
 Next:
 
-- [ ] DAP2 → NetCDF4 re-pack (so output opens in xarray directly)
+- [ ] NetCDF-4 output (HDF5-backed) for larger files / compression
+- [ ] Per-variable attributes in the NetCDF writer (`units`, `_FillValue`, …)
 - [ ] Progress bar on long fetches
 - [ ] Multi-file time-chunked dataset assembly
 - [ ] `360_day` / `all_leap` / `julian` calendar support
