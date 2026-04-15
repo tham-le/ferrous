@@ -130,14 +130,23 @@ pub struct GetArgs {
     #[arg(long, conflicts_with = "lon_deg")]
     pub lon: Option<String>,
 
-    /// Latitude range in degrees, `MIN:MAX` (1D rectilinear grids only).
-    /// Resolves to array indices by fetching the file's lat coordinate.
-    #[arg(long, value_name = "MIN:MAX")]
+    /// Latitude range in degrees, `MIN:MAX`. Works on both 1D rectilinear
+    /// and 2D curvilinear grids — Ferrous picks the right resolver based on
+    /// the coordinate variable's shape.
+    ///
+    /// Hyphens in negative degree values need a `=` to stop clap from
+    /// treating them as flags: `--lat-deg=-10:-5` (space form works for
+    /// positive values, e.g. `--lat-deg 30:46`).
+    #[arg(long, value_name = "MIN:MAX", allow_hyphen_values = true)]
     pub lat_deg: Option<String>,
 
     /// Longitude range in degrees, `MIN:MAX`. Use the same convention as the
     /// dataset (0-360 vs -180-180); auto-rotation isn't done.
-    #[arg(long, value_name = "MIN:MAX")]
+    ///
+    /// For negative values (Western-hemisphere data in the -180..180
+    /// convention), use `--lon-deg=-70:-40` to prevent clap from parsing
+    /// the leading `-` as a flag.
+    #[arg(long, value_name = "MIN:MAX", allow_hyphen_values = true)]
     pub lon_deg: Option<String>,
 
     /// Override the coordinate-variable name used for `--lat-deg`. Defaults
