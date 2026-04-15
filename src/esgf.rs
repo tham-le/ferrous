@@ -29,6 +29,25 @@ use serde::Deserialize;
 use crate::http::Client;
 use crate::{Error, Result};
 
+/// Minimal query-string percent-encoder covering the characters we actually
+/// emit in ESGF queries (dataset ids contain `|`, URLs contain `:` and `/`).
+///
+/// Deliberately not pulling in the `url` crate for this; the input space is
+/// narrow (ESGF dataset ids + CMIP6 facet values) and the rule is "encode
+/// anything that isn't unreserved per RFC 3986".
+fn percent_encode_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// Default search endpoint used when the caller does not pick a node.
 ///
 /// Live-verified working 2026-04. IPSL was the original default but is
@@ -38,12 +57,34 @@ pub const DEFAULT_SEARCH_ENDPOINT: &str = "https://esgf.ceda.ac.uk/esg-search/se
 /// Maximum number of datasets returned per search request.
 pub const DEFAULT_LIMIT: usize = 50;
 
-/// A dataset search query against an ESGF node.
+/// Whether the query targets Dataset records (aggregated) or File records
+/// (individual NetCDF files).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchType {
+    /// Aggregated Dataset records. Use for discovery.
+    #[default]
+    Dataset,
+    /// Individual File records. Use after picking a dataset to enumerate its
+    /// OPeNDAP endpoints.
+    File,
+}
+
+impl SearchType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Dataset => "Dataset",
+            Self::File => "File",
+        }
+    }
+}
+
+/// A search query against an ESGF node — covers both Dataset and File
+/// searches.
 ///
-/// Fields are optional "facets" — the ESGF Solr backend matches any combination
-/// the caller provides. Only `project` has a default (`CMIP6`) because every
-/// other project uses an entirely different schema and a naked search across
-/// all projects is rarely what a user means.
+/// Facet fields are optional; the Solr backend matches any combination the
+/// caller provides. Only `project` has a default (`CMIP6`) because every
+/// other project uses an entirely different schema and a naked cross-project
+/// search is rarely what a user means.
 #[derive(Clone, Debug)]
 pub struct SearchQuery {
     /// ESGF project (default `CMIP6`).
@@ -56,6 +97,11 @@ pub struct SearchQuery {
     pub source_id: Option<String>,
     /// Output frequency (`mon`, `day`, `yr`, ...).
     pub frequency: Option<String>,
+    /// Constrain a File search to a specific parent dataset id. Ignored for
+    /// Dataset searches.
+    pub dataset_id: Option<String>,
+    /// Dataset vs File search. Defaults to Dataset.
+    pub search_type: SearchType,
     /// Number of results to return (default [`DEFAULT_LIMIT`]).
     pub limit: usize,
     /// Result offset for pagination.
@@ -70,6 +116,8 @@ impl Default for SearchQuery {
             experiment_id: None,
             source_id: None,
             frequency: None,
+            dataset_id: None,
+            search_type: SearchType::Dataset,
             limit: DEFAULT_LIMIT,
             offset: 0,
         }
@@ -77,9 +125,22 @@ impl Default for SearchQuery {
 }
 
 impl SearchQuery {
-    /// Start a CMIP6 query.
+    /// Start a CMIP6 Dataset search.
     pub fn cmip6() -> Self {
         Self::default()
+    }
+
+    /// Start a CMIP6 File search filtered to the given parent dataset id.
+    ///
+    /// Dataset records expose an `access` array (which services are
+    /// available) but no URLs; the URLs themselves live on File records. Call
+    /// this to enumerate those URLs once a dataset has been picked.
+    pub fn cmip6_files_of(dataset_id: impl Into<String>) -> Self {
+        Self {
+            search_type: SearchType::File,
+            dataset_id: Some(dataset_id.into()),
+            ..Self::default()
+        }
     }
 
     /// Set the variable id facet.
@@ -121,10 +182,9 @@ impl SearchQuery {
     /// Render the query as URL-encoded parameters appended to an ESGF search
     /// endpoint.
     pub fn to_query_string(&self) -> String {
-        // All facets we emit are safe ASCII (CMIP6 identifiers are
-        // `[A-Za-z0-9._-]`), so naive formatting is sufficient and avoids a
-        // url-crate dependency at this stage. If we ever accept user-facing
-        // free-text queries this must be revisited.
+        // CMIP6 facet values are `[A-Za-z0-9._-]` and safe unescaped. Dataset
+        // IDs contain `|` (pipe between instance-id and data-node) which must
+        // be percent-encoded.
         let mut parts: Vec<String> = Vec::new();
         parts.push(format!("project={}", self.project));
         if let Some(v) = &self.variable_id {
@@ -139,10 +199,12 @@ impl SearchQuery {
         if let Some(v) = &self.frequency {
             parts.push(format!("frequency={v}"));
         }
+        if let Some(v) = &self.dataset_id {
+            parts.push(format!("dataset_id={}", percent_encode_value(v)));
+        }
         parts.push(format!("limit={}", self.limit));
         parts.push(format!("offset={}", self.offset));
-        // type=Dataset keeps aggregated datasets out of the File response.
-        parts.push("type=Dataset".into());
+        parts.push(format!("type={}", self.search_type.as_str()));
         parts.push("format=application%2Fsolr%2Bjson".into());
         parts.join("&")
     }
@@ -229,6 +291,68 @@ pub struct SearchResults {
     pub datasets: Vec<Dataset>,
 }
 
+/// Summary of a single File record — one NetCDF file in a CMIP6 dataset.
+///
+/// Unlike [`Dataset`], File records carry the actual per-file OPeNDAP and
+/// HTTPServer URLs. [`File::opendap_url`] gives back the URL ready for
+/// [`crate::opendap::Constraint::append_to_url`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct File {
+    /// Full ESGF file id (instance_id + `|` + data_node).
+    pub id: String,
+    /// File name (usually the NetCDF filename).
+    pub title: String,
+    /// Parent dataset id.
+    pub dataset_id: String,
+    /// File size in bytes, when advertised by the node.
+    pub size: Option<u64>,
+    /// Earliest timestamp covered by the file, if advertised.
+    pub datetime_start: Option<String>,
+    /// Latest timestamp covered by the file, if advertised.
+    pub datetime_stop: Option<String>,
+    /// SHA256 (or other) checksum reported by ESGF.
+    pub checksum: Option<String>,
+    /// Checksum algorithm name (e.g. `"SHA256"`).
+    pub checksum_type: Option<String>,
+    /// Parsed access URLs grouped by service type.
+    pub urls: Vec<DatasetUrl>,
+}
+
+impl File {
+    /// Return every URL advertised by this file for the given service type
+    /// (case-insensitive).
+    pub fn urls_for_service(&self, service: &str) -> Vec<&DatasetUrl> {
+        self.urls
+            .iter()
+            .filter(|u| u.service.eq_ignore_ascii_case(service))
+            .collect()
+    }
+
+    /// Convenience: first OPeNDAP URL with the `.html` suffix stripped so it
+    /// drops directly into [`crate::opendap::Constraint::append_to_url`].
+    pub fn opendap_url(&self) -> Option<String> {
+        self.urls_for_service("OPENDAP")
+            .first()
+            .map(|u| u.url.trim_end_matches(".html").to_string())
+    }
+
+    /// Convenience: first HTTPServer URL (for non-sliced full downloads).
+    pub fn http_url(&self) -> Option<String> {
+        self.urls_for_service("HTTPServer")
+            .first()
+            .map(|u| u.url.clone())
+    }
+}
+
+/// Paginated set of matching files.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileSearchResults {
+    /// Total matches at the server (may exceed `files.len()`).
+    pub total: usize,
+    /// Files returned in this page.
+    pub files: Vec<File>,
+}
+
 // Solr response deserialization. Kept private — callers see the clean
 // `SearchResults` / `Dataset` types above.
 #[derive(Deserialize)]
@@ -280,7 +404,7 @@ impl SolrDoc {
     }
 }
 
-/// Parse a Solr JSON response body into [`SearchResults`].
+/// Parse a Solr JSON response body into [`SearchResults`] (Dataset shape).
 ///
 /// Exposed for tests and advanced callers that have obtained the raw body
 /// through some other path (e.g. a fixture). Normal users should call
@@ -295,6 +419,78 @@ pub fn parse_response(body: &str) -> Result<SearchResults> {
             .docs
             .into_iter()
             .map(SolrDoc::into_dataset)
+            .collect(),
+    })
+}
+
+// File-shaped Solr doc. ESGF returns different fields for File records than
+// Dataset records, so we parse it as a separate shape rather than trying to
+// share a struct with `Option<…>` everywhere.
+#[derive(Deserialize)]
+struct SolrFileResponse {
+    response: SolrFileInner,
+}
+
+#[derive(Deserialize)]
+struct SolrFileInner {
+    #[serde(rename = "numFound")]
+    num_found: usize,
+    docs: Vec<SolrFileDoc>,
+}
+
+#[derive(Deserialize)]
+struct SolrFileDoc {
+    id: String,
+    #[serde(default)]
+    title: Option<String>,
+    dataset_id: String,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    datetime_start: Option<String>,
+    #[serde(default)]
+    datetime_stop: Option<String>,
+    #[serde(default)]
+    checksum: Vec<String>,
+    #[serde(default)]
+    checksum_type: Vec<String>,
+    #[serde(default)]
+    url: Vec<String>,
+}
+
+impl SolrFileDoc {
+    fn into_file(self) -> File {
+        let title = self.title.unwrap_or_else(|| self.id.clone());
+        let urls = self
+            .url
+            .iter()
+            .filter_map(|raw| DatasetUrl::parse(raw).ok())
+            .collect();
+        File {
+            id: self.id,
+            title,
+            dataset_id: self.dataset_id,
+            size: self.size,
+            datetime_start: self.datetime_start,
+            datetime_stop: self.datetime_stop,
+            checksum: self.checksum.into_iter().next(),
+            checksum_type: self.checksum_type.into_iter().next(),
+            urls,
+        }
+    }
+}
+
+/// Parse a Solr JSON response body into [`FileSearchResults`].
+pub fn parse_file_response(body: &str) -> Result<FileSearchResults> {
+    let parsed: SolrFileResponse =
+        serde_json::from_str(body).map_err(|e| Error::Parse(e.to_string()))?;
+    Ok(FileSearchResults {
+        total: parsed.response.num_found,
+        files: parsed
+            .response
+            .docs
+            .into_iter()
+            .map(SolrFileDoc::into_file)
             .collect(),
     })
 }
@@ -332,6 +528,32 @@ impl SearchClient {
         let body = self.http.get_text(&url).await?;
         let results = parse_response(&body)?;
         if results.datasets.is_empty() {
+            return Err(Error::NoResults);
+        }
+        Ok(results)
+    }
+
+    /// Enumerate File records for a given dataset.
+    ///
+    /// Builds a File-type query with the dataset_id filter and parses the
+    /// response with [`parse_file_response`]. Callers typically pipe each
+    /// returned [`File::opendap_url`] into
+    /// [`crate::opendap::Constraint::append_to_url`].
+    pub async fn search_files(&self, query: &SearchQuery) -> Result<FileSearchResults> {
+        // Defensive: if the caller forgot to switch search_type, do it for
+        // them. File search without SearchType::File silently returns Dataset
+        // records, which would fail to parse here.
+        let query = if query.search_type == SearchType::File {
+            query.clone()
+        } else {
+            let mut q = query.clone();
+            q.search_type = SearchType::File;
+            q
+        };
+        let url = query.to_url(&self.endpoint);
+        let body = self.http.get_text(&url).await?;
+        let results = parse_file_response(&body)?;
+        if results.files.is_empty() {
             return Err(Error::NoResults);
         }
         Ok(results)
@@ -494,5 +716,87 @@ mod tests {
     #[test]
     fn parse_response_rejects_malformed_json() {
         assert!(parse_response("not json").is_err());
+    }
+
+    #[test]
+    fn files_query_emits_type_file_and_encoded_dataset_id() {
+        let q = SearchQuery::cmip6_files_of(
+            "CMIP6.ScenarioMIP.CNRM-CERFACS.CNRM-CM6-1.ssp245.r1i1p1f2.Omon.tos.gn.v20190219|esgf.ceda.ac.uk",
+        );
+        let s = q.to_query_string();
+        assert!(s.contains("type=File"), "{s}");
+        // `|` must be percent-encoded as %7C; `.` is unreserved, stays literal.
+        assert!(s.contains("dataset_id="), "{s}");
+        assert!(s.contains("%7Cesgf.ceda.ac.uk"), "{s}");
+        assert!(!s.contains("type=Dataset"), "{s}");
+    }
+
+    #[test]
+    fn percent_encoder_handles_cmip6_charset() {
+        // Letters, digits, and `._-~` survive; `|`, `:`, `/` are encoded.
+        assert_eq!(percent_encode_value("abc.DEF_123-xyz~"), "abc.DEF_123-xyz~");
+        assert_eq!(percent_encode_value("a|b"), "a%7Cb");
+        assert_eq!(percent_encode_value("a:b/c"), "a%3Ab%2Fc");
+    }
+
+    #[test]
+    fn parse_file_response_extracts_files() {
+        let body = r#"
+        {
+          "responseHeader": {"status": 0},
+          "response": {
+            "numFound": 1,
+            "start": 0,
+            "docs": [
+              {
+                "id": "CMIP6.x.tos_Omon_CNRM-CM6-1_ssp245_gn_201501-210012.nc|esgf.ceda.ac.uk",
+                "title": "tos_Omon_CNRM-CM6-1_ssp245_gn_201501-210012.nc",
+                "dataset_id": "CMIP6.x.v20190219|esgf.ceda.ac.uk",
+                "size": 210893610,
+                "datetime_start": "2015-01-01T12:00:00Z",
+                "datetime_stop": "2100-12-31T12:00:00Z",
+                "checksum": ["25fbde020da252da82bd85c75c5ff72ad8570434bb8d9461b77d0eec4d3d980e"],
+                "checksum_type": ["SHA256"],
+                "url": [
+                  "https://example.org/fileServer/tos.nc|application/netcdf|HTTPServer",
+                  "https://example.org/dodsC/tos.nc.html|application/opendap-html|OPENDAP"
+                ]
+              }
+            ]
+          }
+        }"#;
+        let results = parse_file_response(body).unwrap();
+        assert_eq!(results.total, 1);
+        assert_eq!(results.files.len(), 1);
+        let f = &results.files[0];
+        assert_eq!(f.size, Some(210_893_610));
+        assert_eq!(f.datetime_start.as_deref(), Some("2015-01-01T12:00:00Z"));
+        assert_eq!(f.checksum_type.as_deref(), Some("SHA256"));
+        assert_eq!(
+            f.opendap_url().as_deref(),
+            Some("https://example.org/dodsC/tos.nc")
+        );
+        assert_eq!(
+            f.http_url().as_deref(),
+            Some("https://example.org/fileServer/tos.nc")
+        );
+    }
+
+    #[test]
+    fn parse_file_response_rejects_non_file_payload() {
+        // A Dataset-shaped doc has no `dataset_id` field, so the File parser
+        // refuses it rather than silently constructing a File with an empty
+        // parent. This defends against a caller accidentally pointing
+        // search_files() at the wrong URL.
+        let body = r#"
+        {
+          "response": {
+            "numFound": 1,
+            "docs": [
+              { "id": "x", "variable_id": ["tos"] }
+            ]
+          }
+        }"#;
+        assert!(parse_file_response(body).is_err());
     }
 }
