@@ -14,11 +14,12 @@
 //!
 //! Classic `/esg-search/search` endpoints still exist on the federated nodes
 //! that have not yet migrated to the 1.5 bridge. Known-good defaults as of
-//! early 2026:
+//! 2026-04:
 //!
-//! * `https://esgf-node.ipsl.upmc.fr/esg-search/search`
-//! * `https://esgf.ceda.ac.uk/esg-search/search`
+//! * `https://esgf.ceda.ac.uk/esg-search/search` — **reliable, current default**
 //! * `https://esgf-data.dkrz.de/esg-search/search`
+//! * `https://esgf-node.ipsl.upmc.fr/esg-search/search` — currently returns
+//!   HTTP 500 on Dataset queries, kept listed for when it's fixed
 //!
 //! The LLNL node (`esgf-node.llnl.gov`) now 302-redirects to the ORNL 1.5
 //! bridge, which uses a different API shape and is not yet supported.
@@ -29,7 +30,10 @@ use crate::http::Client;
 use crate::{Error, Result};
 
 /// Default search endpoint used when the caller does not pick a node.
-pub const DEFAULT_SEARCH_ENDPOINT: &str = "https://esgf-node.ipsl.upmc.fr/esg-search/search";
+///
+/// Live-verified working 2026-04. IPSL was the original default but is
+/// currently 500-ing on Dataset queries.
+pub const DEFAULT_SEARCH_ENDPOINT: &str = "https://esgf.ceda.ac.uk/esg-search/search";
 
 /// Maximum number of datasets returned per search request.
 pub const DEFAULT_LIMIT: usize = 50;
@@ -312,9 +316,8 @@ impl SearchClient {
         }
     }
 
-    /// Default IPSL endpoint — a classic `/esg-search/search` node that still
-    /// serves the Solr JSON shape Ferrous understands.
-    pub fn default_ipsl(http: Client) -> Self {
+    /// Client against [`DEFAULT_SEARCH_ENDPOINT`] (currently CEDA).
+    pub fn with_default_endpoint(http: Client) -> Self {
         Self::new(http, DEFAULT_SEARCH_ENDPOINT)
     }
 
