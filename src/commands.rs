@@ -6,11 +6,23 @@
 use std::fs;
 use std::path::Path;
 
+use crate::cache::Cache;
 use crate::cli::{Cli, GetArgs, SearchArgs};
 use crate::esgf::{Dataset, SearchClient, SearchQuery, DEFAULT_SEARCH_ENDPOINT};
 use crate::http::{Client, ClientBuilder, RateLimiter};
 use crate::opendap::{Constraint, Slice};
 use crate::{Error, Result};
+
+/// Build the response cache from global CLI flags.
+pub fn build_cache(cli: &Cli) -> Cache {
+    if cli.no_cache {
+        Cache::disabled()
+    } else if let Some(dir) = &cli.cache_dir {
+        Cache::new(dir)
+    } else {
+        Cache::default_location()
+    }
+}
 
 /// Build an HTTP client from global CLI flags.
 pub fn build_http(cli: &Cli) -> Result<Client> {
@@ -164,22 +176,37 @@ pub async fn run_get(cli: &Cli, args: &GetArgs) -> Result<()> {
         return Ok(());
     }
 
-    // 4. Fetch and write.
+    // 4. Cache lookup → fetch if missing → write to --out.
+    let cache = build_cache(cli);
     println!();
-    println!("Fetching...");
-    let bytes = http.get_bytes(&fetch_url).await?;
+    let (bytes, source) = match cache.get(&fetch_url)? {
+        Some(b) => {
+            println!("Cache hit ({} bytes, 0 fetched).", b.len());
+            (b, "cache")
+        }
+        None => {
+            println!("Fetching...");
+            let b = http.get_bytes(&fetch_url).await?;
+            if let Err(e) = cache.put(&fetch_url, &b) {
+                // Caching is best-effort; a failure to write the cache must
+                // not fail the user-visible fetch.
+                eprintln!("warning: failed to populate cache: {e}");
+            }
+            (b, "network")
+        }
+    };
     ensure_parent_dir(&args.out)?;
     fs::write(&args.out, &bytes)?;
 
     let saved = bytes.len() as f64;
     let full = file.size.unwrap_or(0) as f64;
     println!(
-        "Wrote {} bytes (~{:.1} MB) to {}",
+        "Wrote {} bytes (~{:.2} MB) to {} [via {source}]",
         bytes.len(),
         saved / 1_000_000.0,
         args.out.display()
     );
-    if full > 0.0 && saved > 0.0 {
+    if source == "network" && full > 0.0 && saved > 0.0 {
         let ratio = saved / full * 100.0;
         println!(
             "Transferred {:.2}% of the full file ({:.1}x reduction).",

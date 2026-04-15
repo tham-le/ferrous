@@ -22,6 +22,15 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub endpoint: Option<String>,
 
+    /// Bypass the local response cache for this invocation.
+    #[arg(long, global = true)]
+    pub no_cache: bool,
+
+    /// Override the local cache directory (default: $FERROUS_CACHE_DIR or
+    /// ~/.ferrous/cache).
+    #[arg(long, global = true)]
+    pub cache_dir: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
