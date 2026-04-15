@@ -185,10 +185,26 @@ struct VarSpec {
 /// } <path>;
 /// ```
 ///
-/// Anything we don't recognise is skipped — robust to extra whitespace, blank
-/// lines, and comment-style content that real OPeNDAP servers occasionally
-/// add. Container types (Structure, Sequence, Grid) cause an error because
-/// their data section uses a different XDR layout.
+/// Also handles `Grid` blocks (THREDDS's default wrapper for variables with
+/// associated coordinate axes):
+///
+/// ```text
+/// Grid {
+///   ARRAY:
+///     <Type> <name>[<dim> = <N>][...];
+///   MAPS:
+///     <Type> <map_name>[<dim> = <N>];
+///     ...
+/// } <grid_name>;
+/// ```
+///
+/// On the wire a Grid encodes as the array's XDR followed by each MAP's XDR
+/// in declaration order, so we flatten the grid into N+1 sequential
+/// `VarSpec`s and the decoder reads them sequentially. The grid name
+/// (`} tas;`) is dropped — the inner variables retain their own names.
+///
+/// Other container types (`Structure`, `Sequence`) error eagerly because
+/// their wire layouts differ.
 fn parse_dds(dds: &str) -> Result<Vec<VarSpec>> {
     let mut specs = Vec::new();
     for raw_line in dds.lines() {
@@ -197,12 +213,15 @@ fn parse_dds(dds: &str) -> Result<Vec<VarSpec>> {
             || line.starts_with("Dataset")
             || line.starts_with('{')
             || line.starts_with('}')
+            // Grid wrapper + section labels: structural noise, no data.
+            || line.starts_with("Grid")
+            || line == "ARRAY:"
+            || line == "MAPS:"
         {
             continue;
         }
-        // Reject container types eagerly — better to fail loud than to silently
-        // misdecode the data section.
-        for unsupported in ["Structure", "Sequence", "Grid"] {
+        // Reject container types whose XDR layout we don't yet support.
+        for unsupported in ["Structure", "Sequence"] {
             if line.starts_with(unsupported) {
                 return Err(Error::Parse(format!(
                     "DAP2 container type '{unsupported}' is not supported"
@@ -481,8 +500,46 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_container_type() {
-        let bytes = b"Dataset {\n    Grid g { ... };\n} test;\nData:\n";
+        let bytes = b"Dataset {\n    Structure s { ... };\n} test;\nData:\n";
         assert!(decode(bytes).is_err());
+    }
+
+    #[test]
+    fn decodes_grid_as_flat_sequence_of_array_then_maps() {
+        // Synthetic Grid: tas[time = 2][lat = 2] + maps time + lat.
+        let tas: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0]; // 2 × 2
+        let time_vals: Vec<f64> = vec![100.0, 200.0];
+        let lat_vals: Vec<f64> = vec![-30.0, 30.0];
+
+        let mut bytes = b"Dataset {\n    Grid {\n     ARRAY:\n        Float32 tas[time = 2][lat = 2];\n     MAPS:\n        Float64 time[time = 2];\n        Float64 lat[lat = 2];\n    } tas;\n} test;".to_vec();
+        bytes.extend_from_slice(b"\nData:\n");
+        // ARRAY: tas (4 elements, Float32)
+        bytes.extend_from_slice(&4u32.to_be_bytes());
+        bytes.extend_from_slice(&4u32.to_be_bytes());
+        for v in &tas {
+            bytes.extend_from_slice(&v.to_be_bytes());
+        }
+        // MAP: time (2 elements, Float64)
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+        for v in &time_vals {
+            bytes.extend_from_slice(&v.to_be_bytes());
+        }
+        // MAP: lat (2 elements, Float64)
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+        for v in &lat_vals {
+            bytes.extend_from_slice(&v.to_be_bytes());
+        }
+
+        let r = decode(&bytes).expect("Grid response should decode");
+        assert_eq!(r.variables.len(), 3, "array + 2 maps");
+        assert_eq!(r.variables[0].name, "tas");
+        assert_eq!(r.variables[0].data.as_f32().unwrap(), tas.as_slice());
+        assert_eq!(r.variables[1].name, "time");
+        assert_eq!(r.variables[1].data.as_f64().unwrap(), time_vals.as_slice());
+        assert_eq!(r.variables[2].name, "lat");
+        assert_eq!(r.variables[2].data.as_f64().unwrap(), lat_vals.as_slice());
     }
 
     #[test]
