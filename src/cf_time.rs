@@ -95,20 +95,30 @@ pub struct CfTimeAxis {
 
 impl CfTimeAxis {
     /// Look up the time variable's attributes inside a DAS response, then
-    /// parse them.
+    /// parse them. Uses the shared [`crate::das`] parser.
     pub fn from_das(das: &str, time_var: &str) -> Result<Self> {
-        let attrs = extract_var_attributes(das, time_var)
+        let parsed = crate::das::parse(das);
+        let block = parsed
+            .get(time_var)
             .ok_or_else(|| Error::Parse(format!("DAS does not contain a '{time_var}' block")))?;
-        let units = attrs.get("units").ok_or_else(|| {
+
+        let mut units: Option<&str> = None;
+        let mut calendar_str: Option<&str> = None;
+        for (name, value) in block {
+            if let crate::das::DasValue::Text(s) = value {
+                match name.as_str() {
+                    "units" => units = Some(s),
+                    "calendar" => calendar_str = Some(s),
+                    _ => {}
+                }
+            }
+        }
+        let units = units.ok_or_else(|| {
             Error::Parse(format!(
                 "time variable '{time_var}' has no 'units' attribute"
             ))
         })?;
-        let calendar_str = attrs
-            .get("calendar")
-            .map(String::as_str)
-            .unwrap_or("gregorian");
-        let calendar = Calendar::from_cf(calendar_str)?;
+        let calendar = Calendar::from_cf(calendar_str.unwrap_or("gregorian"))?;
         let (unit, epoch) = parse_units(units)?;
         Ok(Self {
             epoch,
@@ -198,68 +208,6 @@ fn noleap_day_of_year(d: NaiveDate) -> Result<u32> {
     Ok(DAYS[d.month0() as usize] + d.day())
 }
 
-/// Extract `{ attribute_name -> value }` for a single variable block inside a
-/// DAS response. Returns `None` if the variable block is missing.
-///
-/// DAS grammar (simplified):
-///
-/// ```text
-/// Attributes {
-///     <var_name> {
-///         <Type> <attr> <value>;
-///         ...
-///     }
-///     ...
-/// }
-/// ```
-///
-/// We recognise the `String <attr> "<value>";` form (by far the most common
-/// in CMIP6 DAS files). Non-string attribute values are ignored; if you need
-/// them, extend this parser.
-fn extract_var_attributes(
-    das: &str,
-    var_name: &str,
-) -> Option<std::collections::HashMap<String, String>> {
-    // Find `<indent><var_name> {` on its own line.
-    let mut in_block = false;
-    let mut depth = 0;
-    let mut attrs = std::collections::HashMap::new();
-    let opener = format!("{var_name} {{");
-    for raw_line in das.lines() {
-        let line = raw_line.trim();
-        if !in_block {
-            if line == opener {
-                in_block = true;
-                depth = 1;
-            }
-            continue;
-        }
-        if line.ends_with('{') {
-            depth += 1;
-            continue;
-        }
-        if line == "}" {
-            depth -= 1;
-            if depth == 0 {
-                return Some(attrs);
-            }
-            continue;
-        }
-        // Try to parse: `String <name> "<value>";`
-        let stripped = line.trim_end_matches(';').trim();
-        if let Some(rest) = stripped.strip_prefix("String ") {
-            let (name, val) = match rest.split_once(' ') {
-                Some(split) => split,
-                None => continue,
-            };
-            if let Some(v) = val.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-                attrs.insert(name.trim().to_string(), v.to_string());
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,21 +259,6 @@ Attributes {
     #[test]
     fn unknown_unit_errors() {
         assert!(parse_units("fortnights since 1850-01-01").is_err());
-    }
-
-    #[test]
-    fn extract_attrs_pulls_string_attrs() {
-        let attrs = extract_var_attributes(CMIP6_DAS_EXCERPT, "time").unwrap();
-        assert_eq!(attrs.get("calendar").unwrap(), "gregorian");
-        assert_eq!(
-            attrs.get("units").unwrap(),
-            "days since 1850-01-01 00:00:00"
-        );
-    }
-
-    #[test]
-    fn extract_attrs_missing_var_returns_none() {
-        assert!(extract_var_attributes(CMIP6_DAS_EXCERPT, "no_such_var").is_none());
     }
 
     #[test]
