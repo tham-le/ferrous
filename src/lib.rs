@@ -10,6 +10,7 @@
 pub mod cache;
 pub mod cli;
 pub mod commands;
+pub mod dap2;
 pub mod error;
 pub mod esgf;
 pub mod http;
