@@ -17,43 +17,34 @@ from __future__ import annotations
 
 import sys
 
-import numpy as np
 import xarray as xr
 
 
 def summarize(path: str) -> None:
+    # xarray auto-masks _FillValue and parses time-units/calendar from the
+    # attributes Ferrous copied out of DAS. The whole pipeline is three
+    # calls from a bare .nc path to a Celsius climatology.
     ds = xr.open_dataset(path)
     print(ds)
     print()
 
-    tas = ds["tas"]
-    # CMIP6 fill-value is ~1e20; mask anything absurd.
-    valid = tas.where(np.abs(tas) < 1e10)
-    kelvin_to_celsius = 273.15
-    print(f"tas over the fetched region:")
-    print(f"  shape  : {tuple(tas.shape)}")
-    print(f"  min    : {float(valid.min()) - kelvin_to_celsius:6.2f} °C")
-    print(f"  max    : {float(valid.max()) - kelvin_to_celsius:6.2f} °C")
-    print(f"  mean   : {float(valid.mean()) - kelvin_to_celsius:6.2f} °C")
-    print(
-        f"  valid  : {int(valid.count())} / {int(tas.size)} "
-        f"({100 * int(valid.count()) / int(tas.size):.1f}% non-fill)"
-    )
+    tas_c = ds["tas"] - 273.15  # K -> C (units preserved via .attrs)
+    tas_c.attrs["units"] = "degrees_C"
 
-    # Annual-mean timeseries over the full slice — one line with xarray.
-    if "time" in tas.dims and tas.sizes["time"] >= 12:
-        # Group 12 steps per year, average over everything else.
-        n_years = tas.sizes["time"] // 12
-        per_year = (
-            tas.isel(time=slice(0, 12 * n_years))
-            .coarsen(time=12)
-            .mean()
-            .mean(dim=[d for d in tas.dims if d != "time"])
-        )
+    print("tas over the fetched region:")
+    print(f"  shape : {tuple(tas_c.shape)}")
+    print(f"  min   : {float(tas_c.min()):6.2f} °C")
+    print(f"  max   : {float(tas_c.max()):6.2f} °C")
+    print(f"  mean  : {float(tas_c.mean()):6.2f} °C")
+
+    # Annual-mean timeseries over the full slice — one groupby on the
+    # now-real datetime64 time axis.
+    if "time" in tas_c.dims:
+        annual = tas_c.groupby("time.year").mean().mean(dim=["lat", "lon"])
         print()
-        print(f"Annual-mean tas over the region ({n_years} yr):")
-        for year_offset, value in enumerate(per_year.values):
-            print(f"  year +{year_offset:2d}: {float(value) - kelvin_to_celsius:6.2f} °C")
+        print("Annual-mean regional tas:")
+        for year, value in zip(annual["year"].values, annual.values):
+            print(f"  {int(year)}: {float(value):6.2f} °C")
 
 
 if __name__ == "__main__":
