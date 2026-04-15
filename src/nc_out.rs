@@ -28,18 +28,120 @@ const MAGIC: [u8; 4] = *b"CDF\x01"; // classic (32-bit offsets)
 const ABSENT: [u8; 8] = [0; 8]; // ZERO ZERO — empty list
 const NC_DIMENSION: u32 = 0x0A;
 const NC_VARIABLE: u32 = 0x0B;
+const NC_ATTRIBUTE: u32 = 0x0C;
 
 // Type codes.
 const NC_BYTE: u32 = 1;
+const NC_CHAR: u32 = 2;
 const NC_SHORT: u32 = 3;
 const NC_INT: u32 = 4;
 const NC_FLOAT: u32 = 5;
 const NC_DOUBLE: u32 = 6;
 
-/// Write `response` as a NetCDF-3 classic file at `path`, overwriting any
-/// existing file.
+/// Value of a NetCDF-3 attribute.
+///
+/// NetCDF-3 also supports `NC_BYTE` / `NC_SHORT` / `NC_INT` arrays, but those
+/// are rare as attribute types in CMIP6 DAS output; `Text` (from `String`
+/// DAS attributes), `F32` (`_FillValue`, `missing_value`, `scale_factor`, …)
+/// and `F64` (some coord bounds) cover the practical need.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AttrValue {
+    /// UTF-8 string, stored as NC_CHAR.
+    Text(String),
+    /// One or more `f32` values.
+    F32(Vec<f32>),
+    /// One or more `f64` values.
+    F64(Vec<f64>),
+}
+
+impl AttrValue {
+    fn nc_type(&self) -> u32 {
+        match self {
+            Self::Text(_) => NC_CHAR,
+            Self::F32(_) => NC_FLOAT,
+            Self::F64(_) => NC_DOUBLE,
+        }
+    }
+
+    fn nelems(&self) -> u32 {
+        let n = match self {
+            Self::Text(s) => s.len(),
+            Self::F32(v) => v.len(),
+            Self::F64(v) => v.len(),
+        };
+        n as u32
+    }
+
+    /// On-disk byte size of the values block (before padding to 4).
+    fn raw_bytes(&self) -> usize {
+        match self {
+            Self::Text(s) => s.len(),
+            Self::F32(v) => v.len() * 4,
+            Self::F64(v) => v.len() * 8,
+        }
+    }
+
+    /// Total on-disk size including 4-byte padding.
+    fn padded_bytes(&self) -> usize {
+        padded4(self.raw_bytes())
+    }
+
+    fn write_values(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::Text(s) => out.extend_from_slice(s.as_bytes()),
+            Self::F32(v) => {
+                for x in v {
+                    out.extend_from_slice(&x.to_be_bytes());
+                }
+            }
+            Self::F64(v) => {
+                for x in v {
+                    out.extend_from_slice(&x.to_be_bytes());
+                }
+            }
+        }
+        pad_to_4(out);
+    }
+}
+
+/// Collection of attributes to emit: global (`NC_GLOBAL`) plus per-variable.
+///
+/// Declaration order of both global and per-variable attrs is preserved in
+/// the written file, which matters because some downstream tools display
+/// attributes in the order they appear.
+#[derive(Clone, Debug, Default)]
+pub struct Attrs {
+    /// `NC_GLOBAL` attributes in order.
+    pub global: Vec<(String, AttrValue)>,
+    /// Per-variable attributes keyed by variable name; insertion order within
+    /// each variable is preserved.
+    pub per_var: HashMap<String, Vec<(String, AttrValue)>>,
+}
+
+impl Attrs {
+    /// Handy empty constructor for callers that don't have DAS data.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Attributes declared for `var_name`, in insertion order.
+    fn for_var(&self, var_name: &str) -> &[(String, AttrValue)] {
+        self.per_var.get(var_name).map(Vec::as_slice).unwrap_or(&[])
+    }
+}
+
+/// Write `response` as a NetCDF-3 classic file at `path`, no attributes.
 pub fn write(path: &Path, response: &DapResponse) -> Result<()> {
-    let plan = Plan::from_response(response)?;
+    write_with_attrs(path, response, &Attrs::empty())
+}
+
+/// Write `response` with the supplied global + per-variable attributes.
+///
+/// Attribute names that don't correspond to any declared variable are
+/// silently ignored — this lets callers pass in attribute maps extracted
+/// from a DAS that has more variables than were projected.
+pub fn write_with_attrs(path: &Path, response: &DapResponse, attrs: &Attrs) -> Result<()> {
+    let plan = Plan::from_response(response, attrs)?;
     let mut out = Vec::with_capacity(plan.total_size);
     plan.write_header(&mut out)?;
     debug_assert_eq!(out.len(), plan.header_size, "header size prediction");
@@ -51,11 +153,12 @@ pub fn write(path: &Path, response: &DapResponse) -> Result<()> {
     Ok(())
 }
 
-/// Pre-computed file layout — dimensions, per-variable offsets, and the
-/// final file size. Split out of `write` so header assembly and data
-/// emission can be ordered independently.
+/// Pre-computed file layout — dimensions, attributes, per-variable offsets,
+/// and the final file size. Split out of `write` so header assembly and
+/// data emission can be ordered independently.
 struct Plan<'a> {
     dims: Vec<Dim>,
+    globals: &'a [(String, AttrValue)],
     vars: Vec<VarPlan<'a>>,
     header_size: usize,
     total_size: usize,
@@ -70,6 +173,8 @@ struct VarPlan<'a> {
     var: &'a DapVariable,
     /// Index in the dim list for every dimension this variable uses.
     dim_ids: Vec<u32>,
+    /// Attributes to emit for this variable, in order.
+    attrs: &'a [(String, AttrValue)],
     /// Offset (from file start) of the variable's data block. Part of the
     /// header and referenced as `begin` per the spec.
     begin: u32,
@@ -78,7 +183,7 @@ struct VarPlan<'a> {
 }
 
 impl<'a> Plan<'a> {
-    fn from_response(response: &'a DapResponse) -> Result<Self> {
+    fn from_response(response: &'a DapResponse, attrs: &'a Attrs) -> Result<Self> {
         // 1. Collect unique (name, size) dimensions in first-seen order.
         let mut dims: Vec<Dim> = Vec::new();
         let mut dim_index: HashMap<String, usize> = HashMap::new();
@@ -117,8 +222,9 @@ impl<'a> Plan<'a> {
             nc_type_code(var.dtype)?;
         }
 
-        // 3. Compute header size, then assign each variable's begin + vsize.
-        let header_size = header_size(&dims, &response.variables);
+        // 3. Compute header size (now including attributes), then assign
+        //    each variable's begin + vsize.
+        let header_size = header_size(&dims, &attrs.global, &response.variables, attrs);
         let mut vars: Vec<VarPlan<'a>> = Vec::with_capacity(response.variables.len());
         let mut cursor = header_size;
         for var in &response.variables {
@@ -145,6 +251,7 @@ impl<'a> Plan<'a> {
             vars.push(VarPlan {
                 var,
                 dim_ids,
+                attrs: attrs.for_var(&var.name),
                 begin: cursor as u32,
                 vsize: padded as u32,
             });
@@ -153,6 +260,7 @@ impl<'a> Plan<'a> {
 
         Ok(Self {
             dims,
+            globals: attrs.global.as_slice(),
             vars,
             header_size,
             total_size: cursor,
@@ -175,8 +283,8 @@ impl<'a> Plan<'a> {
                 write_u32(out, d.size);
             }
         }
-        // gatt_list — no global attributes.
-        out.extend_from_slice(&ABSENT);
+        // gatt_list
+        write_attr_list(out, self.globals);
         // var_list
         if self.vars.is_empty() {
             out.extend_from_slice(&ABSENT);
@@ -189,8 +297,8 @@ impl<'a> Plan<'a> {
                 for id in &vp.dim_ids {
                     write_u32(out, *id);
                 }
-                // vatt_list — no per-variable attributes.
-                out.extend_from_slice(&ABSENT);
+                // vatt_list
+                write_attr_list(out, vp.attrs);
                 // nc_type + vsize + begin
                 write_u32(out, nc_type_code(vp.var.dtype)?);
                 write_u32(out, vp.vsize);
@@ -199,6 +307,40 @@ impl<'a> Plan<'a> {
         }
         Ok(())
     }
+}
+
+/// Emit an attribute list (either gatt_list or vatt_list). Empty lists are
+/// written as ABSENT per spec.
+fn write_attr_list(out: &mut Vec<u8>, attrs: &[(String, AttrValue)]) {
+    if attrs.is_empty() {
+        out.extend_from_slice(&ABSENT);
+        return;
+    }
+    write_u32(out, NC_ATTRIBUTE);
+    write_u32(out, attrs.len() as u32);
+    for (name, value) in attrs {
+        write_name(out, name);
+        write_u32(out, value.nc_type());
+        write_u32(out, value.nelems());
+        value.write_values(out);
+    }
+}
+
+/// Size in bytes of one attribute on disk.
+fn attr_bytes(name: &str, value: &AttrValue) -> usize {
+    name_bytes(name) + 4 /* type */ + 4 /* nelems */ + value.padded_bytes()
+}
+
+/// Size of an attribute list: either 8 (ABSENT) or tag+nelems+sum(attr).
+fn attr_list_bytes(attrs: &[(String, AttrValue)]) -> usize {
+    if attrs.is_empty() {
+        return 8;
+    }
+    let mut n = 4 /* tag */ + 4 /* nelems */;
+    for (name, value) in attrs {
+        n += attr_bytes(name, value);
+    }
+    n
 }
 
 fn nc_type_code(t: DapType) -> Result<u32> {
@@ -211,11 +353,14 @@ fn nc_type_code(t: DapType) -> Result<u32> {
     }
 }
 
-/// Header size in bytes, assuming:
-/// * no record dim
-/// * no global attrs
-/// * no per-variable attrs
-fn header_size(dims: &[Dim], vars: &[DapVariable]) -> usize {
+/// Header size in bytes. Does include attributes on both the global and
+/// per-variable slots; does NOT include the data section.
+fn header_size(
+    dims: &[Dim],
+    globals: &[(String, AttrValue)],
+    vars: &[DapVariable],
+    attrs: &Attrs,
+) -> usize {
     let mut n = 4 /* magic */ + 4 /* numrecs */;
     // dim_list
     if dims.is_empty() {
@@ -226,8 +371,8 @@ fn header_size(dims: &[Dim], vars: &[DapVariable]) -> usize {
             n += name_bytes(&d.name) + 4 /* size */;
         }
     }
-    // gatt_list — ABSENT
-    n += 8;
+    // gatt_list
+    n += attr_list_bytes(globals);
     // var_list
     if vars.is_empty() {
         n += 8;
@@ -236,7 +381,7 @@ fn header_size(dims: &[Dim], vars: &[DapVariable]) -> usize {
         for v in vars {
             n += name_bytes(&v.name);
             n += 4 /* ndims */ + 4 * v.dimensions.len() /* dimids */;
-            n += 8 /* vatt_list ABSENT */;
+            n += attr_list_bytes(attrs.for_var(&v.name));
             n += 4 /* type */ + 4 /* vsize */ + 4 /* begin */;
         }
     }
@@ -414,7 +559,8 @@ mod tests {
             variables: vec![tas, time_vals, lat],
         };
         let path = write_to_tmp(&response);
-        let plan = Plan::from_response(&response).unwrap();
+        let empty = Attrs::empty();
+        let plan = Plan::from_response(&response, &empty).unwrap();
         assert_eq!(plan.dims.len(), 2, "time + lat, deduped");
         assert_eq!(plan.dims[0].name, "time");
         assert_eq!(plan.dims[1].name, "lat");
@@ -431,7 +577,7 @@ mod tests {
             dds: "…".into(),
             variables: vec![a, b],
         };
-        assert!(Plan::from_response(&response).is_err());
+        assert!(Plan::from_response(&response, &Attrs::empty()).is_err());
     }
 
     #[test]
@@ -468,11 +614,101 @@ mod tests {
                 f32_var("c", vec![("d", 3)], vec![100.0, 200.0, 300.0]),
             ],
         };
-        let plan = Plan::from_response(&response).unwrap();
+        let empty = Attrs::empty();
+        let plan = Plan::from_response(&response, &empty).unwrap();
         let begins: Vec<u32> = plan.vars.iter().map(|v| v.begin).collect();
         assert!(begins[0] < begins[1] && begins[1] < begins[2]);
         assert_eq!(begins[1] - begins[0], plan.vars[0].vsize);
         assert_eq!(begins[2] - begins[1], plan.vars[1].vsize);
+    }
+
+    #[test]
+    fn attrs_round_trip_global_text() {
+        let response = DapResponse {
+            dds: "…".into(),
+            variables: vec![f32_var("x", vec![("d", 1)], vec![1.0])],
+        };
+        let mut attrs = Attrs::empty();
+        attrs
+            .global
+            .push(("Conventions".into(), AttrValue::Text("CF-1.7".into())));
+        let path = write_to_tmp_with_attrs(&response, &attrs);
+        let bytes = std::fs::read(&path).unwrap();
+
+        // Header should contain the tag + literal string somewhere.
+        assert!(
+            bytes.windows(6).any(|w| w == b"CF-1.7"),
+            "global Conventions text should appear verbatim in the header"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn attrs_round_trip_var_fill_value_f32() {
+        let response = DapResponse {
+            dds: "…".into(),
+            variables: vec![f32_var("tas", vec![("d", 1)], vec![290.0])],
+        };
+        let mut attrs = Attrs::empty();
+        attrs
+            .per_var
+            .entry("tas".into())
+            .or_default()
+            .push(("_FillValue".into(), AttrValue::F32(vec![1.0e20])));
+        let path = write_to_tmp_with_attrs(&response, &attrs);
+        let bytes = std::fs::read(&path).unwrap();
+
+        // The f32 1e20 encoded big-endian is [0x60, 0xad, 0x78, 0xec].
+        let needle = 1.0e20_f32.to_be_bytes();
+        assert!(
+            bytes.windows(4).any(|w| w == needle),
+            "_FillValue bytes should appear in the header"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn attr_list_sizing_matches_written_bytes() {
+        // Walk-through: header_size() must agree with how many bytes
+        // write_header() actually emits. Build a plan with every attr kind
+        // on both the global and per-var slots; compare predicted to
+        // actual header length.
+        let tas = f32_var("tas", vec![("d", 1)], vec![290.0]);
+        let response = DapResponse {
+            dds: "…".into(),
+            variables: vec![tas],
+        };
+        let mut attrs = Attrs::empty();
+        attrs
+            .global
+            .push(("Conv".into(), AttrValue::Text("CF-1.7".into())));
+        attrs
+            .global
+            .push(("x".into(), AttrValue::F32(vec![1.0, 2.0])));
+        attrs.global.push(("y".into(), AttrValue::F64(vec![3.0])));
+        attrs.per_var.entry("tas".into()).or_default().extend([
+            ("units".into(), AttrValue::Text("K".into())),
+            ("_FillValue".into(), AttrValue::F32(vec![1.0e20])),
+        ]);
+        let plan = Plan::from_response(&response, &attrs).unwrap();
+        let mut out = Vec::new();
+        plan.write_header(&mut out).unwrap();
+        assert_eq!(out.len(), plan.header_size);
+    }
+
+    /// Shared helper used by attribute tests.
+    fn write_to_tmp_with_attrs(response: &DapResponse, attrs: &Attrs) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "ferrous-nc-attr-test-{}-{}.nc",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_with_attrs(&p, response, attrs).expect("write ok");
+        p
     }
 
     #[test]
