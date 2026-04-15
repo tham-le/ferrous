@@ -1,0 +1,31 @@
+! pyferret_quickstart.jnl
+!
+! FERRET / PyFerret demo: load a Ferrous-produced NetCDF slice and make
+! a quick contour plot. Invoke as:
+!
+!     # first, produce the slice:
+!     ferrous get \
+!         --dataset-id "CMIP6.ScenarioMIP.CNRM-CERFACS.CNRM-CM6-1.ssp245.r1i1p1f2.Amon.tas.gr.v20190219|esgf.ceda.ac.uk" \
+!         --variable tas --time-iso 2020:2025 --lat-deg 30:46 --lon-deg 0:30 \
+!         --out /tmp/ferrous_tas_med.nc
+!
+!     # then run this journal file:
+!     pyferret -script examples/pyferret_quickstart.jnl
+!
+! The entire file is identical to how a researcher would operate on a
+! hand-downloaded 4 GB CMIP6 NetCDF — the ONLY difference is that the
+! file on disk is 77 KB and came from a single `ferrous get` call.
+
+USE "/tmp/ferrous_tas_med.nc"
+
+SHOW DATA
+
+! Convert Kelvin to Celsius for the plot.
+LET tas_c = tas - 273.15
+SET VAR/TITLE="Surface air temperature"/UNITS="degrees_C" tas_c
+
+! Time-average over the full slice, then plot the spatial mean.
+PLOT/CONTOUR/FILL/TITLE="Mediterranean 2020-2025 mean tas (°C)" tas_c[L=@AVE]
+
+! Exit cleanly so the script is batch-runnable.
+EXIT
