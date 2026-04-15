@@ -7,7 +7,8 @@ use std::fs;
 use std::path::Path;
 
 use crate::cache::Cache;
-use crate::cli::{Cli, GetArgs, SearchArgs};
+use crate::cli::{Cli, GetArgs, InspectArgs, SearchArgs};
+use crate::dap2::{self, DapData, DapVariable};
 use crate::esgf::{Dataset, SearchClient, SearchQuery, DEFAULT_SEARCH_ENDPOINT};
 use crate::http::{Client, ClientBuilder, RateLimiter};
 use crate::opendap::{Constraint, Slice};
@@ -264,6 +265,112 @@ fn build_constraint(variable: &str, args: &GetArgs) -> Result<Constraint> {
     } else {
         Constraint::new().select(variable, slices)
     }
+}
+
+/// Run `ferrous inspect`.
+///
+/// Reads a local `.dods` file (typically produced by `ferrous get`),
+/// decodes it via [`crate::dap2`], and prints per-variable shape and
+/// summary statistics. Useful for sanity-checking a fetch and for figuring
+/// out array indices when planning a follow-up slice.
+pub fn run_inspect(args: &InspectArgs) -> Result<()> {
+    let bytes = fs::read(&args.path)?;
+    let response = dap2::decode(&bytes)?;
+
+    println!("File:      {}", args.path.display());
+    println!("Bytes:     {}", bytes.len());
+    println!("Variables: {}", response.variables.len());
+    if args.dds {
+        println!("\n--- DDS ---\n{}\n--- end ---", response.dds);
+    }
+    println!();
+
+    for v in &response.variables {
+        print_variable_summary(v, args.fill_threshold);
+        println!();
+    }
+    Ok(())
+}
+
+fn print_variable_summary(v: &DapVariable, fill_threshold: f64) {
+    let dims: Vec<String> = v
+        .dimensions
+        .iter()
+        .map(|d| format!("{}={}", d.name, d.size))
+        .collect();
+    let dims_str = if dims.is_empty() {
+        "scalar".to_string()
+    } else {
+        format!("[{}]", dims.join(", "))
+    };
+    println!(
+        "{} ({:?}, {}, {} elements)",
+        v.name,
+        v.dtype,
+        dims_str,
+        v.element_count()
+    );
+    let stats = compute_stats(&v.data, fill_threshold);
+    match stats {
+        Some(s) => {
+            println!(
+                "  valid:   {}/{}  ({:.1}% non-fill)",
+                s.valid_count,
+                s.total,
+                100.0 * s.valid_count as f64 / s.total.max(1) as f64
+            );
+            println!("  min:     {}", s.min);
+            println!("  max:     {}", s.max);
+            println!("  mean:    {}", s.mean);
+        }
+        None => println!("  (no stats: variable type or all values masked as fill)"),
+    }
+}
+
+struct Stats {
+    total: usize,
+    valid_count: usize,
+    min: f64,
+    max: f64,
+    mean: f64,
+}
+
+fn compute_stats(data: &DapData, fill_threshold: f64) -> Option<Stats> {
+    // Numeric pull-out: we only summarise floating-point variables. Integer
+    // arrays in CMIP6 are usually time/index axes where min/max/mean are
+    // less meaningful — printing the shape alone is more honest there.
+    let (total, iter): (usize, Box<dyn Iterator<Item = f64> + '_>) = match data {
+        DapData::F32(v) => (v.len(), Box::new(v.iter().map(|&x| x as f64))),
+        DapData::F64(v) => (v.len(), Box::new(v.iter().copied())),
+        _ => return None,
+    };
+    let mut valid_count = 0usize;
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    let mut sum = 0.0_f64;
+    for x in iter {
+        if x.is_nan() || x.abs() >= fill_threshold {
+            continue;
+        }
+        valid_count += 1;
+        if x < min {
+            min = x;
+        }
+        if x > max {
+            max = x;
+        }
+        sum += x;
+    }
+    if valid_count == 0 {
+        return None;
+    }
+    Some(Stats {
+        total,
+        valid_count,
+        min,
+        max,
+        mean: sum / valid_count as f64,
+    })
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<()> {

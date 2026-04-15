@@ -42,6 +42,8 @@ pub enum Command {
     Search(SearchArgs),
     /// Fetch a sliced NetCDF region via OPeNDAP.
     Get(GetArgs),
+    /// Decode a local .dods file and print its DDS + per-variable stats.
+    Inspect(InspectArgs),
 }
 
 /// Arguments to `ferrous search`.
@@ -136,6 +138,22 @@ pub struct GetArgs {
     pub dry_run: bool,
 }
 
+/// Arguments to `ferrous inspect`.
+#[derive(Debug, clap::Args)]
+pub struct InspectArgs {
+    /// Path to a `.dods` file produced by `ferrous get`.
+    pub path: std::path::PathBuf,
+
+    /// Treat absolute values >= this as fill / missing data when computing
+    /// summary stats. Default matches CMIP6's `1e20` _FillValue convention.
+    #[arg(long, default_value_t = 1.0e10)]
+    pub fill_threshold: f64,
+
+    /// Print the raw DDS header in addition to per-variable stats.
+    #[arg(long)]
+    pub dds: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,6 +239,21 @@ mod tests {
             "tos.nc",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn inspect_takes_a_path_argument() {
+        let cli = Cli::try_parse_from(["ferrous", "inspect", "slice.dods", "--dds"]).unwrap();
+        let Command::Inspect(args) = cli.command else {
+            panic!("expected Inspect");
+        };
+        assert_eq!(args.path, std::path::PathBuf::from("slice.dods"));
+        assert!(args.dds);
+    }
+
+    #[test]
+    fn inspect_requires_a_path() {
+        assert!(Cli::try_parse_from(["ferrous", "inspect"]).is_err());
     }
 
     #[test]

@@ -13,6 +13,7 @@ async fn main() -> ExitCode {
     let result = match &cli.command {
         Command::Search(args) => commands::run_search(&cli, args).await,
         Command::Get(args) => commands::run_get(&cli, args).await,
+        Command::Inspect(args) => commands::run_inspect(args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
