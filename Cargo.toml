@@ -2,7 +2,7 @@
 name = "ferrous"
 version = "0.0.1"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.86"
 authors = ["Tham Le <tham@kyber.media>"]
 description = "Fast, ergonomic CMIP6 climate data access via OPeNDAP slicing and local caching"
 repository = "https://github.com/tham-le/ferrous"
