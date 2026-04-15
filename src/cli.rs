@@ -156,9 +156,15 @@ pub struct GetArgs {
     pub extra: Vec<String>,
 
     /// When a dataset resolves to multiple files, pick this one (1-indexed).
-    /// Default: 1.
-    #[arg(long, default_value_t = 1)]
+    /// Default: 1. Mutually exclusive with `--all-files`.
+    #[arg(long, default_value_t = 1, conflicts_with = "all_files")]
     pub file_index: usize,
+
+    /// Fetch every file in the dataset, concatenate along the time axis,
+    /// write one combined output. Files whose time axis doesn't overlap
+    /// `--time-iso` (or `--time`) are skipped automatically.
+    #[arg(long)]
+    pub all_files: bool,
 
     /// Output path for the fetched data.
     #[arg(long, short = 'o')]

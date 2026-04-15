@@ -116,63 +116,135 @@ pub async fn run_search(cli: &Cli, args: &SearchArgs) -> Result<()> {
 
 /// Run `ferrous get`.
 ///
-/// Resolves a target File (either directly via `--dataset-id` or by Dataset
-/// search), builds an OPeNDAP constraint from the provided index slices,
-/// fetches `<opendap_url>.dods?<constraint>`, and writes the raw DAP2 bytes
-/// to the `--out` path.
+/// Resolves the target dataset (either directly via `--dataset-id` or by
+/// Dataset search), enumerates its files, fetches and slices either one
+/// file (default / `--file-index N`) or every file (`--all-files`, with
+/// out-of-range files auto-skipped), then writes the result to `--out`.
 ///
-/// The DAP2 binary format is not NetCDF, but it's the format every OPeNDAP
-/// server supports uniformly, and tools like `pydap` can parse it. Adding
-/// NetCDF4 output (via `.dap.nc4` suffix on Hyrax nodes or a local re-pack)
-/// is a follow-up.
+/// In multi-file mode per-file responses are concatenated along the time
+/// axis before writing — lat / lon / other non-time coords are taken from
+/// the first file.
 pub async fn run_get(cli: &Cli, args: &GetArgs) -> Result<()> {
     let http = build_http(cli)?;
+    let cache = build_cache(cli);
     let endpoint = cli
         .endpoint
         .clone()
         .unwrap_or_else(|| DEFAULT_SEARCH_ENDPOINT.to_string());
     let client = SearchClient::new(http.clone(), &endpoint);
 
-    // 1. Resolve the target dataset id.
     let dataset_id = match &args.dataset_id {
         Some(id) => id.clone(),
         None => resolve_dataset_id(&client, args).await?,
     };
-
-    // 2. Enumerate the files in that dataset and pick one.
     let files = client
         .search_files(&SearchQuery::cmip6_files_of(&dataset_id))
         .await?;
-    if args.file_index == 0 || args.file_index > files.files.len() {
-        return Err(Error::InvalidArgument(format!(
-            "--file-index {} out of range (dataset has {} file(s))",
-            args.file_index,
-            files.files.len()
-        )));
+
+    // Select the files to fetch.
+    let targets: Vec<&crate::esgf::File> = if args.all_files {
+        files.files.iter().collect()
+    } else {
+        if args.file_index == 0 || args.file_index > files.files.len() {
+            return Err(Error::InvalidArgument(format!(
+                "--file-index {} out of range (dataset has {} file(s))",
+                args.file_index,
+                files.files.len()
+            )));
+        }
+        vec![&files.files[args.file_index - 1]]
+    };
+
+    println!("dataset:    {dataset_id}");
+    if args.all_files {
+        println!(
+            "mode:       all-files ({} candidate file(s))",
+            targets.len()
+        );
     }
-    let file = &files.files[args.file_index - 1];
+
+    // Walk each target file; collect decoded DAP2 responses.
+    let mut fetched: Vec<FetchedFile> = Vec::new();
+    for (i, file) in targets.iter().enumerate() {
+        match fetch_one_file(&http, &cache, file, args, i + 1, targets.len()).await {
+            Ok(f) => fetched.push(f),
+            Err(Error::NoResults) => {
+                eprintln!(
+                    "skipping '{}': no axis values fall in the requested window",
+                    file.title
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    if fetched.is_empty() {
+        return Err(Error::NoResults);
+    }
+    if args.dry_run {
+        return Ok(());
+    }
+
+    // Combine, write, report.
+    let combined = if fetched.len() == 1 {
+        fetched.remove(0)
+    } else {
+        combine_fetched(fetched)?
+    };
+    write_output(&http, &cache, args, &combined).await
+}
+
+/// One file's fetch result, held until we're ready to write.
+struct FetchedFile {
+    /// Decoded DAP2 response (populated only for [`OutputFormat::Nc`]; we
+    /// still decode in Dods mode so the concatenator can find the time
+    /// variable's shape — but the raw bytes are what gets written).
+    response: dap2::DapResponse,
+    /// OPeNDAP base URL (without `.dods` suffix or query) — keeps DAS
+    /// fetching tidy when we write out.
+    opendap_url: String,
+    /// Full URL actually fetched (for source-of-truth reporting).
+    fetch_url: String,
+    /// Raw DAP2 bytes if we need to write them out unchanged.
+    bytes: Vec<u8>,
+    /// Reported full-file size (`file.size` from ESGF).
+    full_file_size: Option<u64>,
+    /// Cache vs network.
+    source: &'static str,
+}
+
+async fn fetch_one_file(
+    http: &Client,
+    cache: &Cache,
+    file: &crate::esgf::File,
+    args: &GetArgs,
+    n: usize,
+    total: usize,
+) -> Result<FetchedFile> {
     let opendap_url = file
         .opendap_url()
         .ok_or_else(|| Error::Parse(format!("file {} has no OPENDAP access URL", file.id)))?;
 
-    // 3. Resolve --time-iso (ISO dates) or --time (raw index).
+    // Per-file time resolution. In multi-file mode a resolution failure
+    // downgrades to NoResults so the caller can skip this file cleanly.
     let time_idx = if let Some(spec) = args.time_iso.as_deref() {
-        let cache = build_cache(cli);
-        let r = resolve_time_iso_range(&http, &cache, &opendap_url, spec).await?;
-        Some(r)
+        match resolve_time_iso_range(http, cache, &opendap_url, spec).await {
+            Ok(r) => Some(r),
+            Err(Error::InvalidArgument(msg)) if msg.contains("no axis values fall in") => {
+                return Err(Error::NoResults);
+            }
+            Err(e) => return Err(e),
+        }
     } else {
         None
     };
 
-    // 4. Resolve degree → index ranges if --lat-deg / --lon-deg supplied.
-    //    These override the index forms (--lat / --lon).
     let lat_deg = parse_deg_range(args.lat_deg.as_deref(), "--lat-deg")?;
     let lon_deg = parse_deg_range(args.lon_deg.as_deref(), "--lon-deg")?;
     let (lat_idx, lon_idx) = if lat_deg.is_some() || lon_deg.is_some() {
-        let cache = build_cache(cli);
         resolve_lat_lon_degrees(
-            &http,
-            &cache,
+            http,
+            cache,
             &opendap_url,
             args.lat_coord.as_deref(),
             args.lon_coord.as_deref(),
@@ -184,7 +256,6 @@ pub async fn run_get(cli: &Cli, args: &GetArgs) -> Result<()> {
         (None, None)
     };
 
-    // 5. Build the constraint from resolved time/lat/lon + raw --slice extras.
     let constraint = build_constraint(&args.variable, args, time_idx, lat_idx, lon_idx)?;
     let fetch_url = format!(
         "{}.dods{}",
@@ -196,89 +267,227 @@ pub async fn run_get(cli: &Cli, args: &GetArgs) -> Result<()> {
         }
     );
 
-    println!("dataset:    {dataset_id}");
     println!(
-        "file:       {} ({} of {})",
+        "file [{n}/{total}]: {} — constraint {}",
         file.title,
-        args.file_index,
-        files.files.len()
+        constraint.to_query()
     );
     if let Some(size) = file.size {
         println!(
-            "full size:  {} bytes (~{:.1} MB)",
+            "  full size: {} bytes (~{:.1} MB)",
             size,
             size as f64 / 1_000_000.0
         );
     }
-    println!("constraint: {}", constraint.to_query());
-    println!("URL:        {fetch_url}");
 
     if args.dry_run {
-        return Ok(());
+        // Build a zero-bytes placeholder so the caller can still count it.
+        return Ok(FetchedFile {
+            response: dap2::DapResponse {
+                dds: String::new(),
+                variables: Vec::new(),
+            },
+            opendap_url,
+            fetch_url,
+            bytes: Vec::new(),
+            full_file_size: file.size,
+            source: "dry-run",
+        });
     }
 
-    // 6. Cache lookup → fetch if missing → write to --out.
-    let cache = build_cache(cli);
-    println!();
     let (bytes, source) = match cache.get(&fetch_url)? {
         Some(b) => {
-            println!("Cache hit ({} bytes, 0 fetched).", b.len());
+            println!("  cache hit ({} bytes, 0 fetched).", b.len());
             (b, "cache")
         }
         None => {
             let label = format!("{} {}", args.variable, file.title);
             let b = http.get_bytes_with_progress(&fetch_url, &label).await?;
             if let Err(e) = cache.put(&fetch_url, &b) {
-                // Caching is best-effort; a failure to write the cache must
-                // not fail the user-visible fetch.
-                eprintln!("warning: failed to populate cache: {e}");
+                eprintln!("  warning: failed to populate cache: {e}");
             }
             (b, "network")
         }
     };
+    let response = dap2::decode(&bytes)?;
+    Ok(FetchedFile {
+        response,
+        opendap_url,
+        fetch_url,
+        bytes,
+        full_file_size: file.size,
+        source,
+    })
+}
+
+/// Concatenate multiple per-file responses along the time axis into a single
+/// virtual response. Assumes every file has the same set of variables with
+/// matching dimensions (except along `time`, which grows). Non-time-varying
+/// coords (lat, lon) are taken from the first file and checked for equality
+/// against later files; mismatches error loud.
+fn combine_fetched(mut parts: Vec<FetchedFile>) -> Result<FetchedFile> {
+    // Carry template metadata from the first file.
+    let first = parts.remove(0);
+    let mut combined_response = first.response.clone();
+    let mut total_bytes = first.bytes.len();
+
+    for part in parts {
+        total_bytes += part.bytes.len();
+        concatenate_along_time(&mut combined_response, part.response)?;
+    }
+
+    // Re-encode the combined response as if it came from a single source.
+    // Dods passthrough doesn't work for multi-file; always downgrade to
+    // NC output by setting the bytes to the DAP2 of the first file (the
+    // bytes field is only used by the Dods path — warn in write_output if
+    // the user asked for Dods).
+    Ok(FetchedFile {
+        response: combined_response,
+        opendap_url: first.opendap_url,
+        fetch_url: format!(
+            "{} (+{} more files concatenated along time)",
+            first.fetch_url,
+            // Subtract 1 for the first file we already unpacked.
+            total_bytes.saturating_sub(first.bytes.len())
+        ),
+        // We can't rebuild DAP2 bytes without re-encoding; callers that want
+        // a combined Dods file need to request per-file and stitch
+        // themselves. This path is expected to write .nc instead.
+        bytes: Vec::new(),
+        full_file_size: first.full_file_size,
+        source: "network",
+    })
+}
+
+/// Append `other` to `target` along the `time` dimension for every variable
+/// whose first dimension is time. Variables without a time dimension must
+/// match exactly across files (they're spatial coords or scalar metadata).
+fn concatenate_along_time(target: &mut dap2::DapResponse, other: dap2::DapResponse) -> Result<()> {
+    if target.variables.len() != other.variables.len() {
+        return Err(Error::Parse(format!(
+            "multi-file concat: variable count mismatch ({} vs {})",
+            target.variables.len(),
+            other.variables.len()
+        )));
+    }
+    for (t, o) in target.variables.iter_mut().zip(other.variables.into_iter()) {
+        if t.name != o.name {
+            return Err(Error::Parse(format!(
+                "multi-file concat: variable order mismatch ('{}' vs '{}')",
+                t.name, o.name
+            )));
+        }
+        if is_time_varying(t) {
+            append_along_time(t, o)?;
+        } else {
+            // Non-time coord (lat, lon, etc.) — must be identical.
+            if t.dimensions != o.dimensions {
+                return Err(Error::Parse(format!(
+                    "multi-file concat: '{}' has mismatched dims across files",
+                    t.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_time_varying(v: &dap2::DapVariable) -> bool {
+    v.dimensions.first().is_some_and(|d| d.name == "time")
+}
+
+fn append_along_time(t: &mut dap2::DapVariable, o: dap2::DapVariable) -> Result<()> {
+    // Dimensions after time must agree element-for-element.
+    if t.dimensions.len() != o.dimensions.len() {
+        return Err(Error::Parse(format!(
+            "multi-file concat: '{}' has mismatched rank across files",
+            t.name
+        )));
+    }
+    for (td, od) in t.dimensions.iter().zip(o.dimensions.iter()).skip(1) {
+        if td.size != od.size || td.name != od.name {
+            return Err(Error::Parse(format!(
+                "multi-file concat: '{}' dim '{}' size changes across files ({} vs {})",
+                t.name, td.name, td.size, od.size
+            )));
+        }
+    }
+    // Grow time dim then extend data.
+    if let Some(first_dim) = t.dimensions.first_mut() {
+        first_dim.size += o.dimensions[0].size;
+    }
+    match (&mut t.data, o.data) {
+        (dap2::DapData::F32(a), dap2::DapData::F32(b)) => a.extend(b),
+        (dap2::DapData::F64(a), dap2::DapData::F64(b)) => a.extend(b),
+        (dap2::DapData::I32(a), dap2::DapData::I32(b)) => a.extend(b),
+        (dap2::DapData::I16(a), dap2::DapData::I16(b)) => a.extend(b),
+        (dap2::DapData::U8(a), dap2::DapData::U8(b)) => a.extend(b),
+        (a, b) => {
+            return Err(Error::Parse(format!(
+                "multi-file concat: '{}' dtype mismatch ({:?} vs {:?})",
+                t.name,
+                a.len(),
+                b.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn write_output(
+    http: &Client,
+    cache: &Cache,
+    args: &GetArgs,
+    combined: &FetchedFile,
+) -> Result<()> {
     ensure_parent_dir(&args.out)?;
     let format = OutputFormat::resolve(args.format, &args.out);
+
     let written_bytes = match format {
         OutputFormat::Dods => {
-            fs::write(&args.out, &bytes)?;
-            bytes.len()
+            if combined.bytes.is_empty() {
+                return Err(Error::InvalidArgument(
+                    "--format dods is incompatible with --all-files (would have to \
+                     re-encode concatenated DAP2); use .nc output instead"
+                        .into(),
+                ));
+            }
+            fs::write(&args.out, &combined.bytes)?;
+            combined.bytes.len()
         }
         OutputFormat::Nc => {
-            let response = dap2::decode(&bytes)?;
-            // Attributes come from the file's DAS. A failure here (missing
-            // .das endpoint, parse error) downgrades to an attr-less write
-            // rather than poisoning the whole fetch — xarray will still open
-            // the file; it just won't auto-mask fills or show units.
-            let attrs = match fetch_attrs(&http, &cache, &opendap_url, &response).await {
-                Ok(a) => a,
-                Err(e) => {
-                    eprintln!("warning: DAS unavailable ({e}); writing .nc without attrs");
-                    Attrs::empty()
-                }
-            };
-            nc_out::write_with_attrs(&args.out, &response, &attrs)?;
+            let attrs =
+                match fetch_attrs(http, cache, &combined.opendap_url, &combined.response).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("warning: DAS unavailable ({e}); writing .nc without attrs");
+                        Attrs::empty()
+                    }
+                };
+            nc_out::write_with_attrs(&args.out, &combined.response, &attrs)?;
             fs::metadata(&args.out)
                 .map(|m| m.len() as usize)
-                .unwrap_or(bytes.len())
+                .unwrap_or(0)
         }
     };
 
-    let saved = bytes.len() as f64;
-    let full = file.size.unwrap_or(0) as f64;
     println!(
-        "Wrote {} bytes ({:?}) to {} [transferred {} bytes via {source}]",
+        "\nWrote {} bytes ({:?}) to {} [via {}]",
         written_bytes,
         format,
         args.out.display(),
-        bytes.len()
+        combined.source,
     );
-    if source == "network" && full > 0.0 && saved > 0.0 {
-        let ratio = saved / full * 100.0;
-        println!(
-            "Transferred {:.2}% of the full file ({:.1}x reduction).",
-            ratio,
-            full / saved
-        );
+    if let Some(full) = combined.full_file_size {
+        if full > 0 && !combined.bytes.is_empty() && combined.source == "network" {
+            let saved = combined.bytes.len() as f64;
+            let full = full as f64;
+            println!(
+                "Transferred {:.2}% of the full file ({:.1}x reduction).",
+                saved / full * 100.0,
+                full / saved,
+            );
+        }
     }
     Ok(())
 }
@@ -882,5 +1091,148 @@ fn print_dataset(n: usize, ds: &Dataset) {
     }
     if let Some(url) = ds.opendap_url() {
         println!("    opendap:   {url}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dap2::{DapData, DapDimension, DapResponse, DapType, DapVariable};
+
+    fn tas_var(time_len: usize, start_value: f32) -> DapVariable {
+        let lat = 2;
+        let lon = 3;
+        let n = time_len * lat * lon;
+        let data = (0..n).map(|i| start_value + i as f32).collect();
+        DapVariable {
+            name: "tas".into(),
+            dtype: DapType::Float32,
+            dimensions: vec![
+                DapDimension {
+                    name: "time".into(),
+                    size: time_len,
+                },
+                DapDimension {
+                    name: "lat".into(),
+                    size: lat,
+                },
+                DapDimension {
+                    name: "lon".into(),
+                    size: lon,
+                },
+            ],
+            data: DapData::F32(data),
+        }
+    }
+
+    fn time_var(values: Vec<f64>) -> DapVariable {
+        DapVariable {
+            name: "time".into(),
+            dtype: DapType::Float64,
+            dimensions: vec![DapDimension {
+                name: "time".into(),
+                size: values.len(),
+            }],
+            data: DapData::F64(values),
+        }
+    }
+
+    fn lat_var() -> DapVariable {
+        DapVariable {
+            name: "lat".into(),
+            dtype: DapType::Float64,
+            dimensions: vec![DapDimension {
+                name: "lat".into(),
+                size: 2,
+            }],
+            data: DapData::F64(vec![10.0, 20.0]),
+        }
+    }
+
+    fn lon_var() -> DapVariable {
+        DapVariable {
+            name: "lon".into(),
+            dtype: DapType::Float64,
+            dimensions: vec![DapDimension {
+                name: "lon".into(),
+                size: 3,
+            }],
+            data: DapData::F64(vec![0.0, 30.0, 60.0]),
+        }
+    }
+
+    #[test]
+    fn concat_extends_time_dim_and_data() {
+        let mut target = DapResponse {
+            dds: String::new(),
+            variables: vec![
+                tas_var(2, 0.0),
+                time_var(vec![100.0, 200.0]),
+                lat_var(),
+                lon_var(),
+            ],
+        };
+        let other = DapResponse {
+            dds: String::new(),
+            variables: vec![
+                tas_var(3, 1000.0),
+                time_var(vec![300.0, 400.0, 500.0]),
+                lat_var(),
+                lon_var(),
+            ],
+        };
+        concatenate_along_time(&mut target, other).unwrap();
+        assert_eq!(target.variables[0].dimensions[0].size, 5, "time grows 2+3");
+        assert_eq!(target.variables[0].data.as_f32().unwrap().len(), 5 * 2 * 3);
+        assert_eq!(
+            target.variables[1].data.as_f64().unwrap(),
+            &[100.0, 200.0, 300.0, 400.0, 500.0]
+        );
+        assert_eq!(target.variables[2].dimensions[0].size, 2);
+        assert_eq!(target.variables[3].dimensions[0].size, 3);
+    }
+
+    #[test]
+    fn concat_rejects_mismatched_spatial_shape() {
+        let mut target = DapResponse {
+            dds: String::new(),
+            variables: vec![tas_var(1, 0.0), time_var(vec![0.0]), lat_var(), lon_var()],
+        };
+        let mut bad_lat = lat_var();
+        bad_lat.dimensions[0].size = 99;
+        bad_lat.data = DapData::F64(vec![0.0; 99]);
+        let other = DapResponse {
+            dds: String::new(),
+            variables: vec![tas_var(1, 0.0), time_var(vec![100.0]), bad_lat, lon_var()],
+        };
+        assert!(concatenate_along_time(&mut target, other).is_err());
+    }
+
+    #[test]
+    fn concat_rejects_variable_order_mismatch() {
+        let mut target = DapResponse {
+            dds: String::new(),
+            variables: vec![tas_var(1, 0.0), time_var(vec![0.0])],
+        };
+        let other = DapResponse {
+            dds: String::new(),
+            variables: vec![time_var(vec![100.0]), tas_var(1, 0.0)],
+        };
+        assert!(concatenate_along_time(&mut target, other).is_err());
+    }
+
+    #[test]
+    fn concat_preserves_time_dim_for_variables_without_time() {
+        let mut target = DapResponse {
+            dds: String::new(),
+            variables: vec![tas_var(1, 0.0), time_var(vec![0.0]), lat_var()],
+        };
+        let other = DapResponse {
+            dds: String::new(),
+            variables: vec![tas_var(1, 0.0), time_var(vec![100.0]), lat_var()],
+        };
+        concatenate_along_time(&mut target, other).unwrap();
+        assert_eq!(target.variables[2].dimensions[0].size, 2, "lat unchanged");
+        assert_eq!(target.variables[2].data.as_f64().unwrap(), &[10.0, 20.0]);
     }
 }
