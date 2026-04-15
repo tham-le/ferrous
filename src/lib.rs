@@ -16,6 +16,7 @@ pub mod dap2;
 pub mod error;
 pub mod esgf;
 pub mod http;
+pub mod nc_out;
 pub mod opendap;
 
 pub use error::{Error, Result};
