@@ -22,6 +22,8 @@ Thumbs.db
 
 # Local-only working notes
 PROGRESS.md
+FERROUS.md
+GITHUB_RESEARCH.md
 
 # Python (for future PyO3 bindings)
 __pycache__/
