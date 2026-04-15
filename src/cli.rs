@@ -112,8 +112,15 @@ pub struct GetArgs {
     pub frequency: Option<String>,
 
     /// Time index slice (`START:STOP` or `START:STRIDE:STOP`).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "time_iso")]
     pub time: Option<String>,
+
+    /// Time range as ISO dates, `START:STOP`. Each endpoint is `YYYY`,
+    /// `YYYY-MM-DD`, or `YYYY-MM-DDTHH:MM:SS`. Bare `YYYY` expands to
+    /// Jan 1 (start) / Dec 31 (stop). Requires the file's time axis to
+    /// use a supported CF calendar.
+    #[arg(long, value_name = "START:STOP")]
+    pub time_iso: Option<String>,
 
     /// Latitude index slice.
     #[arg(long, conflicts_with = "lat_deg")]

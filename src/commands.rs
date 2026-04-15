@@ -7,6 +7,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::cache::Cache;
+use crate::cf_time::CfTimeAxis;
 use crate::cli::{Cli, GetArgs, InspectArgs, SearchArgs};
 use crate::coords::{self, IndexRange};
 use crate::dap2::{self, DapData, DapVariable};
@@ -14,6 +15,7 @@ use crate::esgf::{Dataset, SearchClient, SearchQuery, DEFAULT_SEARCH_ENDPOINT};
 use crate::http::{Client, ClientBuilder, RateLimiter};
 use crate::opendap::{Constraint, Slice};
 use crate::{Error, Result};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 
 /// Coordinate-variable names tried in order when `--lat-coord` / `--lon-coord`
 /// is not supplied. CMIP6 atmospheric data uses `lat` / `lon` consistently;
@@ -151,7 +153,16 @@ pub async fn run_get(cli: &Cli, args: &GetArgs) -> Result<()> {
         .opendap_url()
         .ok_or_else(|| Error::Parse(format!("file {} has no OPENDAP access URL", file.id)))?;
 
-    // 3. Resolve degree → index ranges if --lat-deg / --lon-deg supplied.
+    // 3. Resolve --time-iso (ISO dates) or --time (raw index).
+    let time_idx = if let Some(spec) = args.time_iso.as_deref() {
+        let cache = build_cache(cli);
+        let r = resolve_time_iso_range(&http, &cache, &opendap_url, spec).await?;
+        Some(r)
+    } else {
+        None
+    };
+
+    // 4. Resolve degree → index ranges if --lat-deg / --lon-deg supplied.
     //    These override the index forms (--lat / --lon).
     let lat_deg = parse_deg_range(args.lat_deg.as_deref(), "--lat-deg")?;
     let lon_deg = parse_deg_range(args.lon_deg.as_deref(), "--lon-deg")?;
@@ -171,8 +182,8 @@ pub async fn run_get(cli: &Cli, args: &GetArgs) -> Result<()> {
         (None, None)
     };
 
-    // 4. Build the constraint from --time + (resolved or raw) --lat/--lon + --slice.
-    let constraint = build_constraint(&args.variable, args, lat_idx, lon_idx)?;
+    // 5. Build the constraint from resolved time/lat/lon + raw --slice extras.
+    let constraint = build_constraint(&args.variable, args, time_idx, lat_idx, lon_idx)?;
     let fetch_url = format!(
         "{}.dods{}",
         opendap_url,
@@ -204,7 +215,7 @@ pub async fn run_get(cli: &Cli, args: &GetArgs) -> Result<()> {
         return Ok(());
     }
 
-    // 5. Cache lookup → fetch if missing → write to --out.
+    // 6. Cache lookup → fetch if missing → write to --out.
     let cache = build_cache(cli);
     println!();
     let (bytes, source) = match cache.get(&fetch_url)? {
@@ -274,18 +285,22 @@ async fn resolve_dataset_id(client: &SearchClient, args: &GetArgs) -> Result<Str
 /// Assemble an OPeNDAP constraint from `--time`, `--lat`, `--lon`, and any
 /// `--slice` arguments, in the CMIP6-conventional order.
 ///
-/// `lat_resolved` and `lon_resolved` come from degree-based resolution and
-/// take precedence over the corresponding `args.lat` / `args.lon` index
-/// strings when present.
+/// Resolved index ranges (from `--time-iso` / `--lat-deg` / `--lon-deg`) take
+/// precedence over the raw-index forms when both are supplied; clap prevents
+/// that conflict on the user side, but the logic is defensive so library
+/// callers can't silently disagree either.
 fn build_constraint(
     variable: &str,
     args: &GetArgs,
+    time_resolved: Option<IndexRange>,
     lat_resolved: Option<IndexRange>,
     lon_resolved: Option<IndexRange>,
 ) -> Result<Constraint> {
     let mut slices: Vec<Slice> = Vec::new();
-    if let Some(spec) = &args.time {
-        slices.push(spec.parse()?);
+    match (time_resolved, args.time.as_deref()) {
+        (Some(r), _) => slices.push(Slice::range(r.start, r.stop)),
+        (None, Some(spec)) => slices.push(spec.parse()?),
+        (None, None) => {}
     }
     match (lat_resolved, args.lat.as_deref()) {
         (Some(r), _) => slices.push(Slice::range(r.start, r.stop)),
@@ -311,6 +326,111 @@ fn build_constraint(
     } else {
         Constraint::new().select(variable, slices)
     }
+}
+
+/// Parse the user's `--time-iso START:STOP`, fetch the time axis values and
+/// the file's DAS, convert the ISO endpoints to axis-values, and resolve to
+/// an inclusive index range.
+async fn resolve_time_iso_range(
+    http: &Client,
+    cache: &Cache,
+    opendap_url: &str,
+    spec: &str,
+) -> Result<IndexRange> {
+    let (start_str, stop_str) = spec.split_once(':').ok_or_else(|| {
+        Error::InvalidArgument(format!("--time-iso must be START:STOP, got '{spec}'"))
+    })?;
+    let (start_dt, _) = parse_iso_endpoint(start_str, EndpointSide::Start)?;
+    let (stop_dt, _) = parse_iso_endpoint(stop_str, EndpointSide::Stop)?;
+    if stop_dt < start_dt {
+        return Err(Error::InvalidArgument(format!(
+            "--time-iso: stop ({stop_str}) is before start ({start_str})"
+        )));
+    }
+
+    // Fetch the DAS + the time axis values, with cache.
+    let das_url = format!("{opendap_url}.das");
+    let das_bytes = match cache.get(&das_url)? {
+        Some(b) => b,
+        None => {
+            let b = http.get_bytes(&das_url).await?;
+            let _ = cache.put(&das_url, &b);
+            b
+        }
+    };
+    let das = std::str::from_utf8(&das_bytes)
+        .map_err(|e| Error::Parse(format!("DAS response is not UTF-8: {e}")))?;
+    let axis = CfTimeAxis::from_das(das, "time")?;
+
+    let time_var = fetch_coord(http, cache, opendap_url, vec!["time"]).await?;
+    let time_values = coord_values_as_f64(&time_var.data, &time_var.name)?;
+
+    let start_val = axis.datetime_to_axis(start_dt)?;
+    let stop_val = axis.datetime_to_axis(stop_dt)?;
+    let r = coords::resolve_range(&time_values, start_val, stop_val)?;
+    eprintln!(
+        "resolved time: {start_str}..{stop_str} -> axis {start_val}..{stop_val} \
+         -> idx {}..{} ({} steps)",
+        r.start,
+        r.stop,
+        r.len(),
+    );
+    Ok(r)
+}
+
+/// Which end of a range is being parsed — determines how bare `YYYY` or
+/// `YYYY-MM` expand.
+#[derive(Clone, Copy, Debug)]
+enum EndpointSide {
+    Start,
+    Stop,
+}
+
+/// Parse one side of `--time-iso`. Accepts:
+/// * `YYYY` — Jan 1 (start) or Dec 31 23:59:59 (stop)
+/// * `YYYY-MM-DD` — midnight
+/// * `YYYY-MM-DDTHH:MM:SS` — exact
+fn parse_iso_endpoint(s: &str, side: EndpointSide) -> Result<(NaiveDateTime, String)> {
+    let s = s.trim();
+
+    // YYYY
+    if s.len() == 4 {
+        if let Ok(year) = s.parse::<i32>() {
+            let dt = match side {
+                EndpointSide::Start => NaiveDate::from_ymd_opt(year, 1, 1)
+                    .and_then(|d| d.and_hms_opt(0, 0, 0))
+                    .ok_or_else(|| {
+                        Error::InvalidArgument(format!("year {year} is out of range"))
+                    })?,
+                EndpointSide::Stop => NaiveDate::from_ymd_opt(year, 12, 31)
+                    .and_then(|d| d.and_hms_opt(23, 59, 59))
+                    .ok_or_else(|| {
+                        Error::InvalidArgument(format!("year {year} is out of range"))
+                    })?,
+            };
+            return Ok((dt, format!("{year}")));
+        }
+    }
+
+    // YYYY-MM-DDTHH:MM:SS variants.
+    for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"] {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
+            return Ok((dt, s.to_string()));
+        }
+    }
+
+    // YYYY-MM-DD.
+    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        let t = match side {
+            EndpointSide::Start => NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+            EndpointSide::Stop => NaiveTime::from_hms_opt(23, 59, 59).unwrap(),
+        };
+        return Ok((d.and_time(t), s.to_string()));
+    }
+
+    Err(Error::InvalidArgument(format!(
+        "couldn't parse '{s}' as ISO date (expected YYYY, YYYY-MM-DD, or YYYY-MM-DDTHH:MM:SS)"
+    )))
 }
 
 /// Parse a `MIN:MAX` floating-point range used by `--lat-deg` / `--lon-deg`.
