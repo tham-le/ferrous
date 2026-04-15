@@ -3,9 +3,13 @@
 //! Each function here takes already-parsed CLI arguments and returns
 //! `Result<()>`, so the binary stays a thin dispatcher.
 
-use crate::cli::{Cli, SearchArgs};
+use std::fs;
+use std::path::Path;
+
+use crate::cli::{Cli, GetArgs, SearchArgs};
 use crate::esgf::{Dataset, SearchClient, SearchQuery, DEFAULT_SEARCH_ENDPOINT};
 use crate::http::{Client, ClientBuilder, RateLimiter};
+use crate::opendap::{Constraint, Slice};
 use crate::{Error, Result};
 
 /// Build an HTTP client from global CLI flags.
@@ -81,6 +85,164 @@ pub async fn run_search(cli: &Cli, args: &SearchArgs) -> Result<()> {
         );
         for (i, ds) in results.datasets.iter().enumerate() {
             print_dataset(i + 1, ds);
+        }
+    }
+    Ok(())
+}
+
+/// Run `ferrous get`.
+///
+/// Resolves a target File (either directly via `--dataset-id` or by Dataset
+/// search), builds an OPeNDAP constraint from the provided index slices,
+/// fetches `<opendap_url>.dods?<constraint>`, and writes the raw DAP2 bytes
+/// to the `--out` path.
+///
+/// The DAP2 binary format is not NetCDF, but it's the format every OPeNDAP
+/// server supports uniformly, and tools like `pydap` can parse it. Adding
+/// NetCDF4 output (via `.dap.nc4` suffix on Hyrax nodes or a local re-pack)
+/// is a follow-up.
+pub async fn run_get(cli: &Cli, args: &GetArgs) -> Result<()> {
+    let http = build_http(cli)?;
+    let endpoint = cli
+        .endpoint
+        .clone()
+        .unwrap_or_else(|| DEFAULT_SEARCH_ENDPOINT.to_string());
+    let client = SearchClient::new(http.clone(), &endpoint);
+
+    // 1. Resolve the target dataset id.
+    let dataset_id = match &args.dataset_id {
+        Some(id) => id.clone(),
+        None => resolve_dataset_id(&client, args).await?,
+    };
+
+    // 2. Enumerate the files in that dataset and pick one.
+    let files = client
+        .search_files(&SearchQuery::cmip6_files_of(&dataset_id))
+        .await?;
+    if args.file_index == 0 || args.file_index > files.files.len() {
+        return Err(Error::InvalidArgument(format!(
+            "--file-index {} out of range (dataset has {} file(s))",
+            args.file_index,
+            files.files.len()
+        )));
+    }
+    let file = &files.files[args.file_index - 1];
+    let opendap_url = file
+        .opendap_url()
+        .ok_or_else(|| Error::Parse(format!("file {} has no OPENDAP access URL", file.id)))?;
+
+    // 3. Build the constraint from --time/--lat/--lon/--slice.
+    let constraint = build_constraint(&args.variable, args)?;
+    let fetch_url = format!(
+        "{}.dods{}",
+        opendap_url,
+        if constraint.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", constraint.to_query())
+        }
+    );
+
+    println!("dataset:    {dataset_id}");
+    println!(
+        "file:       {} ({} of {})",
+        file.title,
+        args.file_index,
+        files.files.len()
+    );
+    if let Some(size) = file.size {
+        println!(
+            "full size:  {} bytes (~{:.1} MB)",
+            size,
+            size as f64 / 1_000_000.0
+        );
+    }
+    println!("constraint: {}", constraint.to_query());
+    println!("URL:        {fetch_url}");
+
+    if args.dry_run {
+        return Ok(());
+    }
+
+    // 4. Fetch and write.
+    println!();
+    println!("Fetching...");
+    let bytes = http.get_bytes(&fetch_url).await?;
+    ensure_parent_dir(&args.out)?;
+    fs::write(&args.out, &bytes)?;
+
+    let saved = bytes.len() as f64;
+    let full = file.size.unwrap_or(0) as f64;
+    println!(
+        "Wrote {} bytes (~{:.1} MB) to {}",
+        bytes.len(),
+        saved / 1_000_000.0,
+        args.out.display()
+    );
+    if full > 0.0 && saved > 0.0 {
+        let ratio = saved / full * 100.0;
+        println!(
+            "Transferred {:.2}% of the full file ({:.1}x reduction).",
+            ratio,
+            full / saved
+        );
+    }
+    Ok(())
+}
+
+/// Look up a single dataset id using the CMIP6 facet arguments.
+async fn resolve_dataset_id(client: &SearchClient, args: &GetArgs) -> Result<String> {
+    let mut query = SearchQuery::cmip6().variable(&args.variable).limit(5);
+    if let Some(v) = &args.experiment {
+        query = query.experiment(v);
+    }
+    if let Some(v) = &args.source {
+        query = query.source(v);
+    }
+    if let Some(v) = &args.frequency {
+        query = query.frequency(v);
+    }
+
+    let results = client.search(&query).await?;
+    if results.datasets.len() > 1 {
+        eprintln!(
+            "Facets matched {} datasets; picking the first. Use --dataset-id to pin one explicitly:",
+            results.total
+        );
+        for (i, ds) in results.datasets.iter().take(5).enumerate() {
+            eprintln!("  [{}] {}", i + 1, ds.id);
+        }
+    }
+    Ok(results.datasets[0].id.clone())
+}
+
+/// Assemble an OPeNDAP constraint from `--time`, `--lat`, `--lon`, and any
+/// `--slice` arguments, in the CMIP6-conventional order.
+fn build_constraint(variable: &str, args: &GetArgs) -> Result<Constraint> {
+    let mut slices: Vec<Slice> = Vec::new();
+    for spec in [&args.time, &args.lat, &args.lon].into_iter().flatten() {
+        slices.push(spec.parse()?);
+    }
+    for extra in &args.extra {
+        slices.push(extra.parse()?);
+    }
+    if slices.is_empty() {
+        // No slicing requested — project the whole variable. Valid OPeNDAP
+        // but defeats the point of Ferrous; warn so the user knows.
+        eprintln!(
+            "note: no --time/--lat/--lon/--slice given; fetching the full variable. \
+             Use index slices to reduce transfer volume."
+        );
+        Constraint::new().select(variable, std::iter::empty())
+    } else {
+        Constraint::new().select(variable, slices)
+    }
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            fs::create_dir_all(parent)?;
         }
     }
     Ok(())

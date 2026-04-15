@@ -12,6 +12,7 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match &cli.command {
         Command::Search(args) => commands::run_search(&cli, args).await,
+        Command::Get(args) => commands::run_get(&cli, args).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

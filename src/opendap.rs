@@ -34,6 +34,7 @@
 //! ```
 
 use std::fmt::{self, Write as _};
+use std::str::FromStr;
 
 use crate::{Error, Result};
 
@@ -120,6 +121,37 @@ impl Slice {
 impl fmt::Display for Slice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "[{}:{}:{}]", self.start, self.stride, self.stop)
+    }
+}
+
+impl FromStr for Slice {
+    type Err = Error;
+
+    /// Parse a human-written slice:
+    /// - `"a:b"` → contiguous range `[a, b]`.
+    /// - `"a:s:b"` → strided range stepping by `s`.
+    /// - `"n"` → single point at `n`.
+    fn from_str(s: &str) -> Result<Self> {
+        let parts: Vec<&str> = s.split(':').collect();
+        let parse_idx = |p: &str, label: &str| -> Result<usize> {
+            p.trim().parse::<usize>().map_err(|_| {
+                Error::InvalidConstraint(format!(
+                    "slice {label} '{p}' is not a non-negative integer"
+                ))
+            })
+        };
+        match parts.as_slice() {
+            [one] => Ok(Slice::point(parse_idx(one, "index")?)),
+            [a, b] => Slice::strided(parse_idx(a, "start")?, 1, parse_idx(b, "stop")?),
+            [a, s, b] => Slice::strided(
+                parse_idx(a, "start")?,
+                parse_idx(s, "stride")?,
+                parse_idx(b, "stop")?,
+            ),
+            _ => Err(Error::InvalidConstraint(format!(
+                "slice '{s}' must be 'N', 'START:STOP', or 'START:STRIDE:STOP'"
+            ))),
+        }
     }
 }
 
@@ -249,6 +281,25 @@ mod tests {
     #[test]
     fn strided_rejects_reversed_bounds() {
         assert!(Slice::strided(10, 1, 5).is_err());
+    }
+
+    #[test]
+    fn slice_from_str_parses_three_forms() {
+        assert_eq!("7".parse::<Slice>().unwrap(), Slice::point(7));
+        assert_eq!("0:10".parse::<Slice>().unwrap(), Slice::range(0, 10));
+        assert_eq!(
+            "0:2:10".parse::<Slice>().unwrap(),
+            Slice::strided(0, 2, 10).unwrap()
+        );
+    }
+
+    #[test]
+    fn slice_from_str_rejects_bad_input() {
+        assert!("".parse::<Slice>().is_err());
+        assert!("a:b".parse::<Slice>().is_err());
+        assert!("-1:10".parse::<Slice>().is_err());
+        assert!("1:2:3:4".parse::<Slice>().is_err());
+        assert!("10:5".parse::<Slice>().is_err()); // reversed bounds
     }
 
     #[test]
