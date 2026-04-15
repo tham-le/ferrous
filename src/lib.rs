@@ -13,6 +13,7 @@ pub mod cli;
 pub mod commands;
 pub mod coords;
 pub mod dap2;
+pub mod das;
 pub mod error;
 pub mod esgf;
 pub mod http;

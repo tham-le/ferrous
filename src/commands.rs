@@ -11,9 +11,10 @@ use crate::cf_time::CfTimeAxis;
 use crate::cli::{Cli, GetArgs, InspectArgs, OutputFormat, SearchArgs};
 use crate::coords::{self, IndexRange};
 use crate::dap2::{self, DapData, DapVariable};
+use crate::das;
 use crate::esgf::{Dataset, SearchClient, SearchQuery, DEFAULT_SEARCH_ENDPOINT};
 use crate::http::{Client, ClientBuilder, RateLimiter};
-use crate::nc_out;
+use crate::nc_out::{self, AttrValue, Attrs};
 use crate::opendap::{Constraint, Slice};
 use crate::{Error, Result};
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
@@ -244,7 +245,18 @@ pub async fn run_get(cli: &Cli, args: &GetArgs) -> Result<()> {
         }
         OutputFormat::Nc => {
             let response = dap2::decode(&bytes)?;
-            nc_out::write(&args.out, &response)?;
+            // Attributes come from the file's DAS. A failure here (missing
+            // .das endpoint, parse error) downgrades to an attr-less write
+            // rather than poisoning the whole fetch — xarray will still open
+            // the file; it just won't auto-mask fills or show units.
+            let attrs = match fetch_attrs(&http, &cache, &opendap_url, &response).await {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("warning: DAS unavailable ({e}); writing .nc without attrs");
+                    Attrs::empty()
+                }
+            };
+            nc_out::write_with_attrs(&args.out, &response, &attrs)?;
             fs::metadata(&args.out)
                 .map(|m| m.len() as usize)
                 .unwrap_or(bytes.len())
@@ -340,6 +352,62 @@ fn build_constraint(
         Constraint::new().select(variable, std::iter::empty())
     } else {
         Constraint::new().select(variable, slices)
+    }
+}
+
+/// Fetch the DAS for `opendap_url` (cached), parse it, and return attributes
+/// filtered down to the variables that are actually in `response`. Global
+/// attributes are always included.
+async fn fetch_attrs(
+    http: &Client,
+    cache: &Cache,
+    opendap_url: &str,
+    response: &dap2::DapResponse,
+) -> Result<Attrs> {
+    let das_url = format!("{opendap_url}.das");
+    let bytes = match cache.get(&das_url)? {
+        Some(b) => b,
+        None => {
+            let b = http.get_bytes(&das_url).await?;
+            let _ = cache.put(&das_url, &b);
+            b
+        }
+    };
+    let das_text = std::str::from_utf8(&bytes)
+        .map_err(|e| Error::Parse(format!("DAS response is not UTF-8: {e}")))?;
+    let parsed = das::parse(das_text);
+    Ok(das_to_nc_attrs(&parsed, response))
+}
+
+/// Convert a [`das::Attributes`] map into [`Attrs`] suitable for the NetCDF
+/// writer. Drops attributes on variables that aren't in the response (the
+/// DAS always covers every variable of the whole file, but we only write
+/// the variables the DAP2 response actually returned).
+fn das_to_nc_attrs(das_attrs: &das::Attributes, response: &dap2::DapResponse) -> Attrs {
+    let mut out = Attrs::empty();
+    if let Some(global) = das_attrs.get("NC_GLOBAL") {
+        out.global = global
+            .iter()
+            .map(|(n, v)| (n.clone(), das_value_to_attr(v)))
+            .collect();
+    }
+    for var in &response.variables {
+        if let Some(attrs) = das_attrs.get(&var.name) {
+            let list = attrs
+                .iter()
+                .map(|(n, v)| (n.clone(), das_value_to_attr(v)))
+                .collect();
+            out.per_var.insert(var.name.clone(), list);
+        }
+    }
+    out
+}
+
+fn das_value_to_attr(v: &das::DasValue) -> AttrValue {
+    match v {
+        das::DasValue::Text(s) => AttrValue::Text(s.clone()),
+        das::DasValue::F32(v) => AttrValue::F32(v.clone()),
+        das::DasValue::F64(v) => AttrValue::F64(v.clone()),
     }
 }
 
