@@ -120,9 +120,27 @@ impl Client {
 
     /// Rate-limited GET returning the response body as bytes.
     pub async fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
+        self.get_bytes_inner(url, None).await
+    }
+
+    /// Rate-limited GET that streams the body, updating an `indicatif`
+    /// progress bar as chunks arrive.
+    ///
+    /// `label` is the leading text shown in the bar's template (e.g.
+    /// `"tas 2020..2025"`). When stderr is not a TTY indicatif auto-hides;
+    /// callers don't need to check themselves.
+    ///
+    /// Used only for the main data fetch — search / DAS / coord-variable
+    /// requests are too small to warrant a bar and routing them through the
+    /// streaming path would add latency for no visible benefit.
+    pub async fn get_bytes_with_progress(&self, url: &str, label: &str) -> Result<Vec<u8>> {
+        self.get_bytes_inner(url, Some(label)).await
+    }
+
+    async fn get_bytes_inner(&self, url: &str, progress_label: Option<&str>) -> Result<Vec<u8>> {
         let host = host_of(url);
         self.limiter.acquire(&host).await;
-        let resp = self
+        let mut resp = self
             .inner
             .get(url)
             .send()
@@ -135,8 +153,25 @@ impl Client {
                 url: url.to_owned(),
             });
         }
-        let bytes = resp.bytes().await.map_err(|e| Error::Http(e.to_string()))?;
-        Ok(bytes.to_vec())
+        let total = resp.content_length();
+        let bar = progress_label.map(|label| build_progress_bar(label, total));
+
+        // Pre-size to total when we have a Content-Length; otherwise let
+        // Vec grow geometrically.
+        let mut out: Vec<u8> = match total {
+            Some(n) => Vec::with_capacity(n as usize),
+            None => Vec::new(),
+        };
+        while let Some(chunk) = resp.chunk().await.map_err(|e| Error::Http(e.to_string()))? {
+            out.extend_from_slice(&chunk);
+            if let Some(b) = bar.as_ref() {
+                b.inc(chunk.len() as u64);
+            }
+        }
+        if let Some(b) = bar {
+            b.finish_and_clear();
+        }
+        Ok(out)
     }
 
     /// Rate-limited GET returning the body as UTF-8 text.
@@ -200,6 +235,35 @@ impl ClientBuilder {
             limiter: self.limiter,
         })
     }
+}
+
+/// Build an `indicatif::ProgressBar` sized for a streaming HTTP response.
+///
+/// * With a known `Content-Length`, a sized byte-count bar with ETA.
+/// * Without, a spinner that just shows bytes pulled so far.
+///
+/// Both styles are hidden when stderr is not a TTY, so this is safe in
+/// scripts and CI logs.
+fn build_progress_bar(label: &str, total: Option<u64>) -> indicatif::ProgressBar {
+    let (bar, template) = match total {
+        Some(n) => (
+            indicatif::ProgressBar::new(n),
+            "{msg:.green} {bar:30.cyan/blue} {bytes:>10}/{total_bytes:<10} {bytes_per_sec:>12} {eta}",
+        ),
+        None => (
+            indicatif::ProgressBar::new_spinner(),
+            "{msg:.green} {spinner} {bytes:>10} {bytes_per_sec:>12}",
+        ),
+    };
+    // `unwrap` on template parsing is OK: the template is a hard-coded
+    // constant, a typo would be a build-time bug we'd catch via tests.
+    bar.set_style(
+        indicatif::ProgressStyle::with_template(template)
+            .expect("static progress-bar template must parse")
+            .progress_chars("##-"),
+    );
+    bar.set_message(label.to_string());
+    bar
 }
 
 /// Extract the host portion from a URL, falling back to the full URL if

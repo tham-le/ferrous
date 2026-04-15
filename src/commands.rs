@@ -226,8 +226,8 @@ pub async fn run_get(cli: &Cli, args: &GetArgs) -> Result<()> {
             (b, "cache")
         }
         None => {
-            println!("Fetching...");
-            let b = http.get_bytes(&fetch_url).await?;
+            let label = format!("{} {}", args.variable, file.title);
+            let b = http.get_bytes_with_progress(&fetch_url, &label).await?;
             if let Err(e) = cache.put(&fetch_url, &b) {
                 // Caching is best-effort; a failure to write the cache must
                 // not fail the user-visible fetch.
