@@ -20,6 +20,7 @@ name = "ferrous"
 path = "src/main.rs"
 
 [dependencies]
+thiserror = "2"
 
 [dev-dependencies]
 

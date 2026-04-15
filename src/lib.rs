@@ -7,5 +7,9 @@
 //! Modules are added incrementally as the project grows; see `FERROUS.md` for the
 //! roadmap.
 
+pub mod error;
+
+pub use error::{Error, Result};
+
 /// Crate version as declared in `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
