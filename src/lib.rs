@@ -20,6 +20,12 @@ pub mod http;
 pub mod nc_out;
 pub mod opendap;
 
+// PyO3 extension module — only compiled when the `python` feature is
+// enabled (by maturin). Under plain `cargo build` this whole tree is
+// transparent and the cdylib is just unused.
+#[cfg(feature = "python")]
+mod python;
+
 pub use error::{Error, Result};
 
 /// Crate version as declared in `Cargo.toml`.

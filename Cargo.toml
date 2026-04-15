@@ -14,10 +14,21 @@ categories = ["command-line-utilities", "science"]
 [lib]
 name = "ferrous"
 path = "src/lib.rs"
+# cdylib is needed so `maturin develop` can build a Python extension
+# module. The cdylib build is otherwise harmless for non-Python users —
+# cargo will just produce an unused libferrous.so alongside the rlib.
+crate-type = ["rlib", "cdylib"]
 
 [[bin]]
 name = "ferrous"
 path = "src/main.rs"
+
+[features]
+default = []
+# Enable when building the Python wheel via `maturin develop --features
+# python`. pyo3 is pulled in only here so `cargo build` stays independent
+# of libpython.
+python = ["dep:pyo3"]
 
 [dependencies]
 thiserror = "2"
@@ -28,6 +39,7 @@ serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 indicatif = "0.17"
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

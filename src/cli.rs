@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 ///
 /// `ferrous` is a CMIP6 data fetcher; subcommands cover search and (in
 /// upcoming commits) sliced downloads.
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 #[command(name = "ferrous", version, about, long_about = None)]
 pub struct Cli {
     /// Disable polite rate limiting. Use responsibly — ESGF nodes run on
@@ -41,7 +41,7 @@ pub struct Cli {
 /// exactly one Command per invocation, so the few hundred bytes saved by
 /// boxing each arg struct aren't worth the indirection.
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum Command {
     /// Search ESGF for datasets matching the given CMIP6 facets.
     Search(SearchArgs),
@@ -52,7 +52,7 @@ pub enum Command {
 }
 
 /// Arguments to `ferrous search`.
-#[derive(Debug, clap::Args)]
+#[derive(Clone, Debug, clap::Args)]
 pub struct SearchArgs {
     /// CMIP6 variable id (e.g. `tos`, `tas`, `pr`).
     #[arg(long)]
@@ -85,7 +85,7 @@ pub struct SearchArgs {
 /// `--dataset-id` or the CMIP6 facet triple (variable + experiment + source)
 /// may be used; when facets are given Ferrous runs a Dataset search, picks
 /// the first match, and enumerates its files.
-#[derive(Debug, clap::Args)]
+#[derive(Clone, Debug, clap::Args)]
 pub struct GetArgs {
     /// Explicit dataset id (e.g.
     /// `CMIP6.ScenarioMIP.CNRM-CERFACS.CNRM-CM6-1.ssp245.r1i1p1f2.Omon.tos.gn.v20190219|esgf.ceda.ac.uk`).
@@ -206,7 +206,7 @@ impl OutputFormat {
 }
 
 /// Arguments to `ferrous inspect`.
-#[derive(Debug, clap::Args)]
+#[derive(Clone, Debug, clap::Args)]
 pub struct InspectArgs {
     /// Path to a `.dods` file produced by `ferrous get`.
     pub path: std::path::PathBuf,

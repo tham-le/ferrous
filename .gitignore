@@ -25,8 +25,13 @@ PROGRESS.md
 FERROUS.md
 GITHUB_RESEARCH.md
 
-# Python (for future PyO3 bindings)
+# Python / PyO3 bindings build artefacts
 __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+dist/
+*.so
+*.pyd
+# Jupyter checkpoints
+.ipynb_checkpoints/

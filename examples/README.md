@@ -55,7 +55,23 @@ jupyter notebook examples/xarray_quickstart.ipynb
 
 ---
 
-## 3. PyFerret — `pyferret_quickstart.jnl` + `pyferret_quickstart.py`
+## 3. Python bindings — `python_bindings.py`
+
+Use Ferrous directly from Python via its PyO3 extension module — no
+subprocess, no shell-out:
+
+```bash
+pip install maturin
+maturin develop --release --features python   # one-time build
+
+python examples/python_bindings.py
+```
+
+`ferrous.get(...)` returns the path of the written `.nc` file; errors
+raise Python exceptions. Everything else in the script is vanilla
+xarray.
+
+## 4. PyFerret — `pyferret_quickstart.jnl` + `pyferret_quickstart.py`
 
 FERRET is still the reference tool at many ocean/atmosphere research
 labs. Ferrous output feeds straight into the `USE` command; existing

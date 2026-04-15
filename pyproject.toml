@@ -1,0 +1,35 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "ferrous"
+description = "Fast, ergonomic CMIP6 climate data access via OPeNDAP slicing + local caching"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Tham Le", email = "tham@kyber.media" }]
+requires-python = ">=3.9"
+keywords = ["cmip6", "climate", "netcdf", "opendap", "esgf", "xarray"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/tham-le/ferrous"
+
+[tool.maturin]
+# The Python module is just a thin PyO3 binding layer over the main
+# ferrous crate, gated behind the "python" feature flag.
+features = ["python"]
+# We produce a single top-level `ferrous` module from the cdylib. This
+# is distinct from the Rust crate name (also `ferrous`); Python imports
+# only the extension module at runtime.
+module-name = "ferrous"
+# Keep wheels minimal — exclude the rlib artifact and everything else.
+include = ["README.md", "LICENSE"]
