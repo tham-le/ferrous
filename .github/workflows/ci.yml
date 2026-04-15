@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (MSRV)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test (unit + integration + examples)
+        run: cargo test --all-targets
+
+      - name: cargo test (doctests)
+        # --all-targets above explicitly skips doctests, so run them
+        # separately. Cheap — we only have a handful.
+        run: cargo test --doc
+
+      - name: cargo clippy (python feature)
+        run: cargo clippy --features python --all-targets -- -D warnings
+
+      - name: cargo build (python feature)
+        run: cargo build --features python
+
+  python:
+    name: maturin build + import smoke test
+    runs-on: ubuntu-latest
+    needs: rust
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Create venv + install maturin
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install maturin
+
+      - name: Build + install the Python extension
+        run: |
+          . .venv/bin/activate
+          maturin develop --features python
+
+      - name: Import smoke test
+        run: |
+          . .venv/bin/activate
+          python - <<'PY'
+          import ferrous
+          assert hasattr(ferrous, "get"), "ferrous.get missing from module"
+          assert ferrous.__version__, "ferrous.__version__ missing"
+          print(f"ferrous {ferrous.__version__} imported, ferrous.get present")
+          PY
