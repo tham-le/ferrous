@@ -6,10 +6,12 @@
 
 ## Status
 
-`search` finds CMIP6 datasets on ESGF, `get` fetches only the slice you
-ask for via OPeNDAP (with degree- or index-based selection), `inspect`
-decodes the result locally. All tested end-to-end against the live CEDA
-node.
+Working end-to-end: `search` / `get` / `inspect` CLI subcommands,
+`--out file.nc` produces a real NetCDF-3 classic file with all the CF
+metadata (`units`, `calendar`, `_FillValue`, …) that xarray / PyFerret /
+MATLAB / R expect. A `ferrous.get(...)` Python binding lives behind an
+optional Cargo feature, buildable via `maturin develop --features python`.
+Everything tested end-to-end against the live CEDA ESGF node.
 
 ## Quick start
 
@@ -113,21 +115,27 @@ NetCDF-4 (HDF5-backed) is a roadmap item.
 
 ## Examples
 
-Three ready-to-run demos live in [`examples/`](examples/):
+Ready-to-run demos live in [`examples/`](examples/):
 
 ```bash
-# xarray one-shot
+# xarray one-shot (Python script + bash wrapper)
 ./examples/run_xarray.sh
 
-# Jupyter notebook
+# Jupyter notebook with inline plots
 jupyter notebook examples/xarray_quickstart.ipynb
 
-# PyFerret (journal file)
+# Python bindings — no subprocess, no shell-out
+maturin develop --release --features python   # one-time build
+python examples/python_bindings.py
+
+# PyFerret (journal file or Python-driven)
 pyferret -script examples/pyferret_quickstart.jnl
+python examples/pyferret_quickstart.py
 ```
 
-All three pull the same 77 KB Mediterranean slice and produce a figure
-or summary. See [`examples/README.md`](examples/README.md) for details.
+All examples pull the same 77 KB Mediterranean slice and produce a
+figure or summary. See [`examples/README.md`](examples/README.md) for
+details and prerequisites.
 
 ## Roadmap
 
@@ -139,21 +147,19 @@ Done:
 - [x] `search` / `get` / `inspect` subcommands
 - [x] Content-addressed local cache — repeat requests = 0 bytes
 - [x] DAP2 binary decoder + Grid container support
-- [x] Degree-based `--lat-deg` / `--lon-deg` — 1D rectilinear
-- [x] 2D curvilinear coordinate resolution — CMIP6 ocean tri-polar grids
-- [x] ISO date `--time-iso 2020:2050` via CF time-units + calendar parsing
-- [x] NetCDF-3 classic output — `--out file.nc` opens directly in xarray / PyFerret
-- [x] `examples/` — xarray, Jupyter, PyFerret quickstarts
+- [x] Degree-based `--lat-deg` / `--lon-deg` (1D + 2D curvilinear)
+- [x] ISO-date `--time-iso 2020:2050` via CF time-units
+- [x] All five CF calendars — gregorian / noleap / all_leap / 360_day / julian
+- [x] NetCDF-3 classic output with global + per-variable attributes
+- [x] `--all-files` mode — multi-file time-axis concatenation
+- [x] Streaming progress bar on the main data fetch
+- [x] PyO3 Python bindings — `import ferrous; ferrous.get(...)`
+- [x] `examples/` — xarray, Jupyter, PyFerret, Python-bindings quickstarts
 
-Next:
+Not yet:
 
 - [ ] NetCDF-4 output (HDF5-backed) for larger files / compression
-- [ ] Per-variable attributes in the NetCDF writer (`units`, `_FillValue`, …)
-- [ ] Progress bar on long fetches
-- [ ] Multi-file time-chunked dataset assembly
-- [ ] `360_day` / `all_leap` / `julian` calendar support
-- [ ] PyO3 Python bindings
-- [ ] Argovis (Argo float) support
+- [ ] Argovis (Argo float) support — separate data source, deserves its own module
 
 ## License
 
