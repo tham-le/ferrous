@@ -21,8 +21,11 @@ path = "src/main.rs"
 
 [dependencies]
 thiserror = "2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 lto = "thin"

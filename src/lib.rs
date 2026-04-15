@@ -8,6 +8,7 @@
 //! roadmap.
 
 pub mod error;
+pub mod http;
 pub mod opendap;
 
 pub use error::{Error, Result};
