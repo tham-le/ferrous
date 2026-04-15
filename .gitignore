@@ -1,0 +1,27 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Ferrous local data
+.ferrous/
+*.nc
+*.nc4
+!tests/fixtures/*.nc
+!tests/fixtures/*.nc4
+
+# Python (for future PyO3 bindings)
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
